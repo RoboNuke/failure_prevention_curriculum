@@ -1,45 +1,61 @@
-# Default config — values reproduce the runner's prior hardcoded behavior.
+# Default config — Isaac Lab Lift Cube (Franka) with Bernoulli gripper.
 # Every registered ConfigManager header must appear; every key under a header
 # must match a dataclass field exactly. Unknown headers/keys are hard errors.
 
+runner_cfg:
+  task: Isaac-Lift-Cube-Franka-v0
+  num_envs: 1024                    # envs PER agent
+  num_agents: 1
+  total_timesteps: 10_000_000           # env.step() calls (train mode); transitions = total_timesteps * num_envs * num_agents
+  eval_timesteps: 250               # env.step() calls (eval mode)
+  memory_size: 2_000_000            # replay buffer capacity PER AGENT
+  seed: -1                          # -1 = non-deterministic
+
 sac_cfg:
-  gradient_steps: 1
-  batch_size: 512                  # std SAC range; was 4096 (too large)
+  gradient_steps: 8
+  batch_size: 1024                  
   discount_factor: 0.99
   polyak: 0.005
-  learning_rate: 1.0e-4            # matches Isaac Lab Lift PPO baseline; was 3e-4
-  random_timesteps: 1000
-  learning_starts: 1000
+  actor_lr: 1.0e-4                 # AdamW
+  critic_lr: 1.0e-4                # AdamW
+  entropy_lr: 1.0e-4               # AdamW (weight_decay always 0 for entropy)
+  weight_decay: 1.0e-2                # decoupled weight decay applied to actor + critic
+  random_timesteps: 0
+  learning_starts: 0
   learn_entropy: true
-  initial_entropy_value: 0.2
-  target_entropy: null            # null => skrl picks -|A|
+  initial_entropy_value: 1.0e-2
+  target_entropy: -4            # null => skrl picks -|A|
   grad_norm_clip: 0.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler   # critical for Lift's heterogeneous obs scales
   observation_preprocessor_kwargs: {}               # runner injects {size, device} from env
+  rewards_shaper_scale: null                       # set a float to scale rewards by this constant
+  gripper_action_idx: 7                             # log Gripper / open rate diagnostic; null disables
   predict_success: false
-  success_bce_weight: 1.0
+  success_td_weight: 1.0
+  success_td_discount: 0.99    # unused when predict_success=false
   success_info_key: is_success
   success_wrapper: null            # set to "lift" (and predict_success: true) for Lift
   experiment:
     directory: runs
     experiment_name: ""           # empty => runner auto-generates as <task>_sac_N<num_agents>
-    write_interval: auto
+    write_interval: 250
     checkpoint_interval: auto
 
 model_cfg:
   actor:
     act_init_std: 1.0
-    actor_n: 2
-    actor_latent: 256
-    last_layer_scale: 0.01            # standard SAC trick: tiny init -> small initial actions, less tanh saturation
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1           # standard SAC trick: tiny init -> small initial actions, less tanh saturation
     clip_log_std: true
     min_log_std: -20.0
     max_log_std: 2.0
     reduction: sum
     use_state_dependent_std: false
+    bernoulli_action_dims: [7]      # Lift gripper (act_dim=8: arm 0-6, gripper 7); null/[] for all-continuous
   critic:
     critic_output_init_mean: 0.0
-    critic_n: 3
+    critic_n: 2
     critic_latent: 1024
     clip_actions: false

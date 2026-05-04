@@ -1,14 +1,22 @@
-"""Trajectory-staged replay memory for SAC + success prediction.
+"""Trajectory-staged replay memory for SAC + success-prediction TD targets.
 
 Subclass of :class:`MultiRandomMemory` that solves the "label availability lags
-transition writing" problem inherent to per-trajectory success labels:
+transition writing" problem inherent to per-step success-prediction targets:
 
 * Transitions are NOT written to the main buffer when ``add_samples`` is called.
-  They go into a per-env *staging* tensor of length ``max_episode_length``.
+  They go into per-env *staging* tensors of length ``max_episode_length``.
 * When :meth:`finalize_trajectory` is called for an env (typically on episode
-  termination), all of that env's staged transitions are copied into the main
-  buffer at the env's column with the success label baked into a
-  ``trajectory_succeeded`` slot. The staging counter is reset.
+  termination), the staged transitions are scanned for the first step where
+  ``is_success_step`` was True (the trajectory's first-success step t*) and
+  three derived per-step fields are computed:
+    - ``is_first_success_step[t]``: 1.0 at t == t*, else 0.0.
+    - ``success_terminal[t]``: 1.0 at t == t* (success-terminal) OR at the
+      final staged step if the trajectory failed (failure-terminal); else 0.0.
+    - ``success_loss_mask[t]``: 1.0 for steps that contribute to the success-
+      head loss (= all pre-and-up-to-success-step steps for successful
+      trajectories; all steps for failed ones); 0.0 for post-success steps
+      (label is undefined past first-success per design).
+  These plus the regular transition tensors are committed to the main buffer.
 * The main buffer therefore only ever contains finalized rows — SAC never
   trains against stale labels and there's no in-place mutation.
 
@@ -136,32 +144,34 @@ class TrajectoryBufferedMemory(MultiRandomMemory):
     # ------------------------------------------------------------------
     # Episode-end commit
     # ------------------------------------------------------------------
-    def finalize_trajectory(
-        self, env_indices: torch.Tensor, success_labels: torch.Tensor
-    ) -> None:
+    def finalize_trajectory(self, env_indices: torch.Tensor) -> None:
         """Commit each finishing env's staged trajectory to the main buffer.
 
+        Reads each env's staged ``is_success_step`` (per-step bool) to find the
+        first-success step t*, then computes and stamps the three success-head
+        TD-target ingredients (``is_first_success_step``, ``success_terminal``,
+        ``success_loss_mask``) across that env's committed slots. SAC then
+        builds the bootstrap target online during ``update`` from these fields
+        plus the (live) head's prediction at next_obs.
+
         :param env_indices: 1D LongTensor of env indices whose trajectories just ended.
-        :param success_labels: 1D float tensor (same length as ``env_indices``) with
-            the per-trajectory success label (0.0 or 1.0). Stamped into
-            ``trajectory_succeeded`` for every committed row.
         """
-        if "trajectory_succeeded" not in self.tensors:
-            raise KeyError(
-                "finalize_trajectory requires the 'trajectory_succeeded' tensor "
-                "to be registered (call create_tensor first — SAC.init() does this)."
-            )
+        for required in (
+            "is_success_step",
+            "is_first_success_step",
+            "success_terminal",
+            "success_loss_mask",
+        ):
+            if required not in self.tensors:
+                raise KeyError(
+                    f"finalize_trajectory requires the '{required}' tensor to be "
+                    f"registered (call create_tensor first — SAC.init() does this)."
+                )
         env_indices = env_indices.flatten().to(torch.long)
-        success_labels = success_labels.flatten().to(torch.float32)
-        if env_indices.shape != success_labels.shape:
-            raise ValueError(
-                f"env_indices shape {tuple(env_indices.shape)} != success_labels "
-                f"shape {tuple(success_labels.shape)}"
-            )
 
         # Process envs sequentially — trajectory length varies per env so vectorising
         # the slice writes is awkward. With a few envs finishing per step this is fast.
-        for env_i, label in zip(env_indices.tolist(), success_labels.tolist()):
+        for env_i in env_indices.tolist():
             n = int(self._stage_t[env_i].item())
             if n == 0:
                 continue  # nothing staged (e.g. env reset on the very first step)
@@ -170,11 +180,38 @@ class TrajectoryBufferedMemory(MultiRandomMemory):
             slot_offsets = torch.arange(n, device=self.device)
             slot_idxs = (base + slot_offsets) % self.memory_size
 
+            # Copy the regular staged tensors first (observations, actions, etc.).
             for name, staged in self._staging.items():
                 self.tensors[name][slot_idxs, env_i] = staged[env_i, :n]
 
-            # Stamp the trajectory's success label across the same slots.
-            self.tensors["trajectory_succeeded"][slot_idxs, env_i, 0] = label
+            # Find first-success step t* (or -1 if none).
+            is_succ = self._staging["is_success_step"][env_i, :n, 0].bool()
+            success_idx = is_succ.nonzero(as_tuple=False).flatten()
+            if success_idx.numel() > 0:
+                t_star = int(success_idx[0].item())
+                # is_first_success_step: 1 at t*, else 0.
+                first_succ = torch.zeros(n, device=self.device, dtype=torch.float32)
+                first_succ[t_star] = 1.0
+                # success_terminal: 1 at t*, else 0 (no failure-terminal, the
+                # trajectory succeeded so the success-MDP terminates at t*).
+                terminal = torch.zeros(n, device=self.device, dtype=torch.float32)
+                terminal[t_star] = 1.0
+                # success_loss_mask: 1 for steps in [0, t*], 0 for (t*, n-1].
+                # Post-success states have undefined "P(success)" — masked out.
+                mask = torch.zeros(n, device=self.device, dtype=torch.float32)
+                mask[: t_star + 1] = 1.0
+            else:
+                # Failed trajectory — final staged step is the failure-terminal.
+                first_succ = torch.zeros(n, device=self.device, dtype=torch.float32)
+                terminal = torch.zeros(n, device=self.device, dtype=torch.float32)
+                terminal[n - 1] = 1.0
+                # All steps contribute to the loss (target propagates 0 backward
+                # through bootstrap: γ · 0 = 0).
+                mask = torch.ones(n, device=self.device, dtype=torch.float32)
+
+            self.tensors["is_first_success_step"][slot_idxs, env_i, 0] = first_succ
+            self.tensors["success_terminal"][slot_idxs, env_i, 0] = terminal
+            self.tensors["success_loss_mask"][slot_idxs, env_i, 0] = mask
 
             # Bookkeeping: advance the per-env head, set filled if we crossed.
             new_index = base + n

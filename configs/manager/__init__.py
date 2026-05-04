@@ -10,6 +10,7 @@ from configs.manager.preprocessor_registry import (
     available_preprocessors,
     resolve_preprocessor,
 )
+from configs.manager.runner_cfg import RunnerCfg
 from configs.manager.sac_cfg import SAC_CFG
 
 __all__ = [
@@ -18,6 +19,7 @@ __all__ = [
     "ModelCfg",
     "ActorCfg",
     "CriticCfg",
+    "RunnerCfg",
     "resolve_preprocessor",
     "available_preprocessors",
 ]

@@ -1,0 +1,68 @@
+# Factory Nut Thread (IndustReal-style env). Direct-API task with asymmetric AC.
+# action_space=6 (all continuous). obs=21, state=72. Episode: 30s @ 15Hz = 450 steps.
+# Hardest of the three Factory tasks — long episodes, rotation-aware success criterion.
+#
+# Success prediction via pipeline's BCE head (TrajectoryBufferedMemory auto-selected).
+# Every registered ConfigManager header must appear; unknown keys are hard errors.
+
+runner_cfg:
+  task: Isaac-Factory-NutThread-Direct-v0
+  num_envs: 256
+  num_agents: 1
+  total_timesteps: 200_000          # env.step() calls; long episodes need more samples
+  eval_timesteps: 450               # env.step() calls (~1 NutThread episode)
+  memory_size: 2_000_000            # replay buffer capacity PER AGENT
+  seed: -1                          # -1 = non-deterministic
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 1024                  # per agent
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4                  # AdamW
+  critic_lr: 1.0e-4                 # AdamW
+  entropy_lr: 1.0e-4                # AdamW
+  weight_decay: 1.0e-2              # decoupled weight decay applied to actor + critic
+  random_timesteps: 0
+  learning_starts: 450              # >= max_episode_length so every env finalizes
+                                    # at least one trajectory before SAC.update()
+                                    # fires (TrajectoryBufferedMemory requirement)
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -3                # -|num_continuous|/2 (= -3 for 6-dim continuous)
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null          # no gripper on Factory tasks
+  predict_success: true             # use pipeline's BCE success head
+  success_td_weight: 1.0            # weight on the success-head TD loss
+  success_td_discount: 0.998        # γ for the discounted-success target;
+                                    # ≈1 − 1/L → "P(success within ~450 steps)"
+  success_info_key: is_success
+  success_wrapper: null             # auto-detect "factory" wrapper from task prefix
+  experiment:
+    directory: runs
+    experiment_name: ""
+    write_interval: 450             # one episode per write
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null
+    force_zero_action_dims: null    # Factory uses all 6 action dims
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false

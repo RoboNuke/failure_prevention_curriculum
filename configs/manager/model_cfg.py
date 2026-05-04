@@ -23,6 +23,22 @@ class ActorCfg:
     max_log_std: float = 2.0
     reduction: str = "sum"
     use_state_dependent_std: bool = False
+    bernoulli_action_dims: list[int] | None = None
+    """Action dims that should be sampled from a Bernoulli (binary) distribution
+    instead of a squashed Gaussian. Output is mapped {0,1} -> {-1,+1} for env
+    compatibility (Isaac Lab's BinaryJointAction reads <0 as close, >=0 as open).
+    Uses a straight-through estimator so the critic Q-gradient flows back into
+    the policy via the soft probability. ``None`` or ``[]`` keeps every dim
+    continuous. For Lift Franka set to ``[7]`` (gripper)."""
+
+    force_zero_action_dims: list[int] | None = None
+    """Action dims that should be hard-coded to 0 in the policy output (no
+    learnable parameters allocated, no log_prob contribution). Useful for envs
+    that internally ignore certain action dims — e.g., Forge sets actions[:, 3:5]
+    to zero inside ``_apply_action``, so we can match by setting
+    ``force_zero_action_dims: [3, 4]`` to avoid wasting actor capacity on
+    predictions the env will discard. ``None`` or ``[]`` disables. Must not
+    overlap with ``bernoulli_action_dims``."""
 
 
 @dataclasses.dataclass(kw_only=True)

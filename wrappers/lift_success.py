@@ -1,12 +1,14 @@
 """Per-step success injection for ``Isaac-Lift-Cube-Franka-v0``.
 
-Subclasses skrl's ``IsaacLabWrapper``. After every step, computes the canonical
-Isaac Lab success condition (``object_reached_goal``: object position within
-``threshold`` meters of the commanded goal pose) and writes the resulting per-env
-boolean tensor into ``info[info_key]`` so SAC's success-prediction head can train
-on it.
+Inherits per-env reward decomposition from :class:`RewardDecompositionWrapper`
+and adds:
 
-The success condition function and its threshold default match what Isaac Lab
+* ``info["is_success"]`` per step — computed via Isaac Lab's stock
+  ``object_reached_goal`` termination function (object position within
+  ``threshold`` meters of the commanded goal pose). SAC consumes this for the
+  rolling success-rate diagnostic and for the optional success-prediction head.
+
+The success-condition function and its threshold default match what Isaac Lab
 ships in
 ``isaaclab_tasks.manager_based.manipulation.lift.mdp.terminations.object_reached_goal``;
 in the stock Lift cfg this term exists but is **not** registered as an active
@@ -21,11 +23,12 @@ from typing import Any
 from isaaclab_tasks.manager_based.manipulation.lift.mdp.terminations import (
     object_reached_goal,
 )
-from skrl.envs.wrappers.torch.isaaclab_envs import IsaacLabWrapper
+
+from wrappers.reward_decomposition import RewardDecompositionWrapper
 
 
-class LiftSuccessWrapper(IsaacLabWrapper):
-    """Adds ``info["is_success"]`` per step for the Lift task."""
+class LiftSuccessWrapper(RewardDecompositionWrapper):
+    """Adds ``info["is_success"]`` per step on top of generic reward decomposition."""
 
     def __init__(
         self,
@@ -41,13 +44,12 @@ class LiftSuccessWrapper(IsaacLabWrapper):
         self._success_info_key = str(info_key)
 
     def step(self, actions):
+        # super().step() already injects per_env_rew + per_env_rew_mask.
         obs, reward, terminated, truncated, info = super().step(actions)
         is_success = object_reached_goal(
             self._unwrapped,
             command_name=self._success_command_name,
             threshold=self._success_threshold,
         )
-        # ``info`` and ``self._info`` reference the same dict (skrl stores the
-        # latest one on the wrapper); a single write is visible everywhere.
         info[self._success_info_key] = is_success
         return obs, reward, terminated, truncated, info

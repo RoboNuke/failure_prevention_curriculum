@@ -1,0 +1,64 @@
+# Forge Nut Thread — Isaac Lab direct-API task. action_space=7, obs=21, state=72
+# (asymmetric actor-critic auto-detected). Episode: 30s @ 15Hz = 450 steps —
+# longest of the three Forge tasks; the success-prediction reward term is
+# especially relevant here because a successful insert is rare during exploration.
+# Every registered ConfigManager header must appear; unknown keys are hard errors.
+
+runner_cfg:
+  task: Isaac-Forge-NutThread-Direct-v0
+  num_envs: 256
+  num_agents: 1
+  total_timesteps: 100_000          # env.step() calls; long episodes need a bigger budget
+  eval_timesteps: 450               # env.step() calls (~1 NutThread episode at 450 steps)
+  memory_size: 2_000_000            # replay buffer capacity PER AGENT
+  seed: -1                          # -1 = non-deterministic
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 1024
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4                  # AdamW
+  critic_lr: 1.0e-4                 # AdamW
+  entropy_lr: 1.0e-4                # AdamW (weight_decay always 0 for entropy)
+  weight_decay: 1.0e-2              # decoupled weight decay applied to actor + critic
+  random_timesteps: 0
+  learning_starts: 0
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -4                # null => skrl picks -|num_continuous|
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null          # no gripper on Forge tasks
+  predict_success: false            # Forge handles success internally via the action space
+  success_td_weight: 1.0
+  success_td_discount: 0.99    # unused when predict_success=false
+  success_info_key: is_success
+  success_wrapper: null             # auto-detect "forge" wrapper from task prefix
+  experiment:
+    directory: runs
+    experiment_name: ""             # empty => runner auto-generates as <task>_sac_N<num_agents>
+    write_interval: 450             # one episode per write
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1           # tiny init → small initial actions, less tanh saturation
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null     # all-continuous (no binary gripper)
+    force_zero_action_dims: [3, 4]  # Forge sets actions[:, 3:5] = 0 internally
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false

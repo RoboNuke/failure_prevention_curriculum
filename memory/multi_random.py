@@ -53,18 +53,15 @@ class MultiRandomMemory(Memory):
         mini_batches: int = 1,
         sequence_length: int = 1,
     ) -> List[List[torch.Tensor]]:
-        """Sample a single mini-batch of size `batch_size`, partitioned by agent.
+        """Sample a mini-batch with ``batch_size`` transitions **per agent**.
 
-        Per-agent env partitioning: rows ``[i*per_agent, (i+1)*per_agent)`` of
-        the returned batch come exclusively from envs ``[i*envs_per_agent,
-        (i+1)*envs_per_agent)``. This matches how block-parallel layers reshape
-        the flat batch back to ``(num_agents, per_agent, dim)``.
+        Each agent draws ``batch_size`` transitions from its own env-partition
+        slice. Total returned rows = ``batch_size * num_agents``, ordered as
+        ``[agent0_chunk, agent1_chunk, ...]`` so block-parallel layers reshape
+        ``(num_agents * batch_size, dim) -> (num_agents, batch_size, dim)``
+        cleanly.
         """
-        if batch_size % self.num_agents != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be divisible by num_agents ({self.num_agents})"
-            )
-        per_agent = batch_size // self.num_agents
+        per_agent = batch_size
 
         # Cap timestep range to filled portion of the memory to avoid sampling NaN slots.
         timestep_high = self.memory_size if self.filled else max(self.memory_index, 1)

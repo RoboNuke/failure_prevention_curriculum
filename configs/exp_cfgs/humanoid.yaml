@@ -1,0 +1,61 @@
+# Humanoid — Isaac Lab manager-based classic locomotion task. DMC-equivalent:
+# humanoid-walk / humanoid-run. Hardest of the three classic tasks. act_dim=21, obs_dim~75.
+# Every registered ConfigManager header must appear; unknown keys are hard errors.
+
+runner_cfg:
+  task: Isaac-Humanoid-v0
+  num_envs: 512                     # tighter than Ant due to GPU memory
+  num_agents: 1
+  total_timesteps: 10_000_000          # env.step() calls; locomotion needs more samples
+  eval_timesteps: 960               # env.step() calls
+  memory_size: 2_000_000            # replay buffer capacity PER AGENT
+  seed: -1
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 256
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4
+  critic_lr: 1.0e-4
+  entropy_lr: 1.0e-4
+  weight_decay: 1.0e-2
+  random_timesteps: 1920
+  learning_starts: 100
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -10.5              # null => skrl picks -|A| = -1
+  grad_norm_clip: 0.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: null          # no gripper in this task
+  predict_success: false
+  success_td_weight: 1.0
+  success_td_discount: 0.99    # unused when predict_success=false
+  success_info_key: is_success
+  success_wrapper: null             # auto-detect won't fire for non-Lift tasks
+  experiment:
+    directory: runs
+    experiment_name: ""             # runner auto-generates as <task>_sac_N<num_agents>
+    write_interval: 960
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.01
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: null     # all-continuous action space
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false

@@ -19,6 +19,7 @@ from typing import Any
 import yaml
 
 from configs.manager.model_cfg import ModelCfg
+from configs.manager.runner_cfg import RunnerCfg
 from configs.manager.sac_cfg import SAC_CFG
 
 
@@ -74,6 +75,7 @@ class ConfigManager:
     """
 
     REGISTRY: dict[str, type] = {
+        "runner_cfg": RunnerCfg,
         "sac_cfg": SAC_CFG,
         "model_cfg": ModelCfg,
     }

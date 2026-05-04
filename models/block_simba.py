@@ -159,10 +159,19 @@ class BlockSimBa(nn.Module):
 #  Squashed-Gaussian actor
 # -----------------------------
 class BlockSimBaActor(GaussianMixin, Model):
-    """SAC policy: squashed-Gaussian over action space, block-parallel across agents.
+    """SAC policy: hybrid continuous + discrete (Bernoulli) action distribution,
+    block-parallel across agents.
 
-    Reads `inputs["observations"]` per skrl SAC convention. `act()` returns the
-    tanh-squashed action and a log-prob with the SAC Jacobian correction applied.
+    Most action dims use a tanh-squashed Gaussian (standard SAC). Indices listed
+    in ``bernoulli_action_dims`` are sampled from a Bernoulli (binary) instead;
+    the {0,1} sample is mapped to {-1,+1} so Isaac Lab's BinaryJointAction sees
+    the right sign convention. A straight-through estimator carries the critic's
+    gradient back through the soft probability so SAC's reparameterized policy
+    gradient still works for those dims.
+
+    Reads ``inputs["observations"]`` per skrl SAC convention. ``act()`` returns
+    the (mixed) action vector and a combined log_prob = continuous-squashed-
+    Gaussian log_prob + Bernoulli log_prob.
     """
 
     def __init__(
@@ -181,6 +190,8 @@ class BlockSimBaActor(GaussianMixin, Model):
         reduction: str = "sum",
         use_state_dependent_std: bool = False,
         predict_success: bool = True,
+        bernoulli_action_dims: list[int] | None = None,
+        force_zero_action_dims: list[int] | None = None,
     ):
         Model.__init__(
             self,
@@ -201,83 +212,186 @@ class BlockSimBaActor(GaussianMixin, Model):
         self.use_state_dependent_std = use_state_dependent_std
         self.predict_success = predict_success
 
+        # Resolve which action dims are continuous vs Bernoulli vs force-zero.
+        # Indices into the full action vector that the env consumes (so env-side
+        # ordering is preserved when we reassemble below). The three sets are
+        # disjoint and partition range(num_actions).
+        bdims = sorted(set(bernoulli_action_dims or []))
+        zdims = sorted(set(force_zero_action_dims or []))
+        for d in bdims:
+            if d < 0 or d >= self.num_actions:
+                raise ValueError(
+                    f"bernoulli_action_dims index {d} out of range [0, {self.num_actions})"
+                )
+        for d in zdims:
+            if d < 0 or d >= self.num_actions:
+                raise ValueError(
+                    f"force_zero_action_dims index {d} out of range [0, {self.num_actions})"
+                )
+        if set(bdims) & set(zdims):
+            raise ValueError(
+                "bernoulli_action_dims and force_zero_action_dims must be disjoint; "
+                f"overlap = {sorted(set(bdims) & set(zdims))}"
+            )
+        self.bernoulli_dims: list[int] = bdims
+        self.force_zero_dims: list[int] = zdims
+        self.continuous_dims: list[int] = [
+            d for d in range(self.num_actions) if d not in bdims and d not in zdims
+        ]
+        self.num_bernoulli = len(self.bernoulli_dims)
+        self.num_force_zero = len(self.force_zero_dims)
+        self.num_continuous = len(self.continuous_dims)
+
+        # The backbone produces only `num_continuous + num_bernoulli` action outputs
+        # (force-zero dims have no model parameters at all). Within that compressed
+        # output, the layout is: [continuous_means | bernoulli_logits].
+        self._policy_out_dim = self.num_continuous + self.num_bernoulli
+        # Backbone-output indices (where to slice from raw_out).
+        self._cont_out_idx = torch.arange(
+            0, self.num_continuous, dtype=torch.long, device=device
+        )
+        self._bern_out_idx = torch.arange(
+            self.num_continuous, self._policy_out_dim, dtype=torch.long, device=device
+        )
+        # Action-vector indices (where to scatter into the env-facing action tensor).
+        self._cont_action_idx = torch.as_tensor(self.continuous_dims, dtype=torch.long, device=device)
+        self._bern_action_idx = torch.as_tensor(self.bernoulli_dims, dtype=torch.long, device=device)
+        self._zero_action_idx = torch.as_tensor(self.force_zero_dims, dtype=torch.long, device=device)
+
         self.actor_mean = BlockSimBa(
             num_agents=num_agents,
             obs_dim=self.num_observations,
             hidden_dim=actor_latent,
-            act_dim=self.num_actions,
+            act_dim=self._policy_out_dim,   # ← shrunk: no params allocated for force-zero dims
             device=device,
             num_blocks=actor_n,
             use_state_dependent_std=use_state_dependent_std,
             predict_success=predict_success,
         ).to(device)
 
+        # log_std parameters cover ONLY continuous dims (Bernoulli has no σ).
         if use_state_dependent_std:
             with torch.no_grad():
-                self.actor_mean.fc_out.bias[:, self.num_actions:] = math.log(act_init_std)
-                self.actor_mean.fc_out.weight[:, self.num_actions:, :] *= 0.1
+                # State-dep std rows live at [act_dim : act_dim + std_out_dim] in the
+                # backbone, where act_dim = _policy_out_dim. We restrict consumption
+                # to the continuous-only slice (self._cont_out_idx) at runtime.
+                self.actor_mean.fc_out.bias[:, self._policy_out_dim:] = math.log(act_init_std)
+                self.actor_mean.fc_out.weight[:, self._policy_out_dim:, :] *= 0.1
             self.actor_logstd = None
         else:
             self.actor_logstd = nn.ParameterList(
                 [
-                    nn.Parameter(torch.ones(1, self.num_actions) * math.log(act_init_std))
+                    nn.Parameter(torch.ones(1, self.num_continuous) * math.log(act_init_std))
                     for _ in range(num_agents)
                 ]
             ).to(device)
 
         with torch.no_grad():
-            self.actor_mean.fc_out.weight[:, : self.num_actions, :] *= last_layer_scale
+            # Scale only the action-output rows (first _policy_out_dim).
+            self.actor_mean.fc_out.weight[:, : self._policy_out_dim, :] *= last_layer_scale
 
     def compute(self, inputs, role):
         obs = inputs["observations"]
         num_envs = obs.size(0) // self.num_agents
-        action_mean, log_std, success_logit = self.actor_mean(obs, num_envs)
+        raw_out, log_std, success_logit = self.actor_mean(obs, num_envs)
+        # raw_out shape: (N*B, _policy_out_dim) where the layout is
+        #   [0 : num_continuous)                          -> continuous Gaussian means
+        #   [num_continuous : num_continuous+num_bernoulli) -> Bernoulli logits
+        # Force-zero action dims are NOT produced by the model — they're inserted
+        # as 0 in the env-facing action vector inside act().
 
         if not self.use_state_dependent_std:
-            batch_size = action_mean.size(0) // self.num_agents
+            batch_size = raw_out.size(0) // self.num_agents
             log_std = torch.cat(
-                [p.expand(batch_size, self.num_actions) for p in self.actor_logstd], dim=0
+                [p.expand(batch_size, self.num_continuous) for p in self.actor_logstd], dim=0
             )
+        elif self.num_continuous < self._policy_out_dim:
+            # State-dep std emits one std per backbone-output dim (continuous +
+            # bernoulli). Restrict to continuous-only since Bernoulli has no σ.
+            log_std = log_std.index_select(-1, self._cont_out_idx)
+
         outputs = {"log_std": log_std}
         if success_logit is not None:
             outputs["success_logit"] = success_logit
-        return action_mean, outputs
+        return raw_out, outputs
 
     def act(self, inputs, *, role: str = ""):
-        # Squashed-Gaussian sampling with Jacobian correction; emits the (actions, outputs)
-        # 2-tuple that skrl 2.x expects, with log_prob in outputs for SAC's update loop.
-        mean_actions, outputs = self.compute(inputs, role)
-        log_std = outputs["log_std"]
+        # Hybrid continuous (squashed Gaussian) + discrete (Bernoulli) sampling.
+        # Returns (actions, outputs) per skrl 2.x convention; outputs["log_prob"]
+        # is the combined log-prob used by SAC's policy / entropy losses.
+        raw_out, outputs = self.compute(inputs, role)
+        log_std = outputs["log_std"]  # (N*B, num_continuous)
 
         if self._g_clip_log_std:
             log_std = torch.clamp(log_std, min=self._g_min_log_std, max=self._g_max_log_std)
             outputs["log_std"] = log_std
 
-        self._g_distribution = Normal(mean_actions, log_std.exp())
-
-        u = self._g_distribution.rsample()
-        actions = torch.tanh(u)
-
-        # On replay, evaluate log_prob at the taken actions; otherwise use our fresh sample.
         taken_actions = inputs.get("taken_actions", None)
-        u_for_log_prob = u if taken_actions is None else safe_atanh(taken_actions)
+        batch = raw_out.shape[0]
+        log_prob_parts: list[torch.Tensor] = []
+        actions = raw_out.new_zeros((batch, self.num_actions))
+        cont_dist = None
 
-        log_prob = (
-            self._g_distribution.log_prob(u_for_log_prob).sum(dim=-1)
-            - squash_log_prob_correction(u_for_log_prob)
-        )
-        if log_prob.dim() != actions.dim():
-            log_prob = log_prob.unsqueeze(-1)
+        # ---- continuous head (squashed Gaussian on continuous_dims) ----
+        # Read from the FIRST num_continuous columns of the (compressed) backbone
+        # output; scatter into the env-facing action positions self._cont_action_idx.
+        if self.num_continuous > 0:
+            cont_mean = raw_out.index_select(-1, self._cont_out_idx)     # (N*B, num_continuous)
+            sigma = log_std.exp()
+            cont_dist = Normal(cont_mean, sigma)
+            self._g_distribution = cont_dist  # for GaussianMixin.get_entropy() compat
+            if taken_actions is None:
+                u = cont_dist.rsample()
+            else:
+                # Replay path: recover pre-tanh u from stored continuous actions in (-1, 1).
+                taken_cont = taken_actions.index_select(-1, self._cont_action_idx)
+                u = safe_atanh(taken_cont)
+            a_cont = torch.tanh(u)
+            # log p(a_cont) = log p(u) - sum log(1 - tanh^2(u))   (Jacobian correction)
+            lp_cont = (
+                cont_dist.log_prob(u).sum(dim=-1, keepdim=True)
+                - squash_log_prob_correction(u).unsqueeze(-1)
+            )
+            log_prob_parts.append(lp_cont)
+            actions.index_copy_(-1, self._cont_action_idx, a_cont)
+
+        # ---- Bernoulli head (binary on bernoulli_dims, mapped to {-1,+1}) ----
+        # Read from the SECOND block of backbone output columns; scatter into the
+        # env-facing Bernoulli action positions self._bern_action_idx.
+        if self.num_bernoulli > 0:
+            bern_logit = raw_out.index_select(-1, self._bern_out_idx)    # (N*B, num_bernoulli)
+            bern_prob = torch.sigmoid(bern_logit)
+            if taken_actions is None:
+                # Fresh sample: draw a Bernoulli sample, route gradient through prob via
+                # straight-through estimator. forward = sample, backward = bern_prob.
+                with torch.no_grad():
+                    bern_sample = (torch.rand_like(bern_prob) < bern_prob).float()
+                bern_st = (bern_sample - bern_prob).detach() + bern_prob
+                a_bern = 2.0 * bern_st - 1.0                              # {-1, +1} forward
+            else:
+                # Replay path: stored action is in {-1, +1}; decode to {0, 1} for log_prob.
+                # Forward action goes back to env shape; gradient flows through bern_prob
+                # via straight-through so the critic Q-grad reaches the policy.
+                taken_bern = taken_actions.index_select(-1, self._bern_action_idx)
+                bern_sample = ((taken_bern + 1.0) / 2.0).round().clamp(0.0, 1.0)
+                bern_st = (bern_sample - bern_prob).detach() + bern_prob
+                a_bern = 2.0 * bern_st - 1.0
+            bern_dist = torch.distributions.Bernoulli(probs=bern_prob)
+            lp_bern = bern_dist.log_prob(bern_sample).sum(dim=-1, keepdim=True)
+            log_prob_parts.append(lp_bern)
+            actions.index_copy_(-1, self._bern_action_idx, a_bern)
+
+        log_prob = log_prob_parts[0] if len(log_prob_parts) == 1 else sum(log_prob_parts)
 
         outputs["log_prob"] = log_prob
-        outputs["mean_actions"] = mean_actions
+        outputs["mean_actions"] = raw_out
         if "success_logit" in outputs:
             outputs["success_prob"] = torch.sigmoid(outputs["success_logit"])
         return actions, outputs
 
     def get_entropy(self, *, role: str = ""):
-        # Use base Normal entropy as a proxy; the squashed Gaussian has no clean closed form
-        # and SAC uses log_prob (not entropy) in the policy gradient.
+        # Continuous-Gaussian entropy as a proxy; the squashed/Bernoulli mixture has
+        # no clean closed form and SAC uses log_prob (not entropy) in the gradient.
         if self._g_distribution is None:
             return torch.tensor(0.0, device=self.device)
         return self._g_distribution.entropy().to(self.device)

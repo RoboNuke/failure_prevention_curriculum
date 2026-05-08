@@ -37,7 +37,12 @@ sac_cfg:
   success_td_weight: 1.0
   success_td_discount: 0.99    # unused when predict_success=false
   success_info_key: is_success
+  success_heatmap_step_bins: 30    # vertical bins on success/fail P-mean heatmaps;
+                                    # set to max_episode_length for one row per step
   success_wrapper: null             # auto-detect "forge" wrapper from task prefix
+  recorder:
+    enabled: false                  # TiledCamera unusable on this IsaacSim/driver/GPU combo;
+                                    # see configs/exp_cfgs/default.yaml for the full block.
   experiment:
     directory: runs
     experiment_name: ""             # empty => runner auto-generates as <task>_sac_N<num_agents>

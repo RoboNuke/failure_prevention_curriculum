@@ -12,10 +12,18 @@ runner_cfg:
   task: Isaac-Factory-PegInsert-Direct-v0
   num_envs: 256
   num_agents: 1
-  total_timesteps: 50_000           # env.step() calls; transitions = total_timesteps * num_envs * num_agents
+  total_timesteps: 40_000           # env.step() calls; transitions = total_timesteps * num_envs * num_agents
   eval_timesteps: 150               # env.step() calls (~1 PegInsert episode)
   memory_size: 2_000_000            # replay buffer capacity PER AGENT
   seed: -1                          # -1 = non-deterministic
+  # Free-form overrides on the parsed Isaac Lab env_cfg (applied before gym.make).
+  # Keys are dotted paths into env_cfg; unknown leaves are a hard error. Values
+  # below are PegInsert's stock defaults (factory_tasks_cfg.py PegInsert) — edit
+  # to widen/narrow the initial hand-pose distribution.
+  env_cfg_overrides:
+    task.hand_init_pos: [0.0, 0.0, 0.1]        # mean hand pos relative to fixed-asset tip [m]
+    task.hand_init_pos_noise: [0.60, 0.10, 0.02] # ± uniform XYZ noise on hand pos [m]
+    task.hand_init_orn_noise: [0.0, 0.0, 0.785]  # ± uniform RPY noise on hand orn [rad]
 
 sac_cfg:
   gradient_steps: 8
@@ -27,7 +35,7 @@ sac_cfg:
   entropy_lr: 1.0e-4                # AdamW (weight_decay always 0 for entropy)
   weight_decay: 1.0e-2              # decoupled weight decay applied to actor + critic
   random_timesteps: 0
-  learning_starts: 2000              # >= max_episode_length so every env finalizes
+  learning_starts: 1500              # >= max_episode_length so every env finalizes
                                     # at least one trajectory before SAC.update()
                                     # fires (TrajectoryBufferedMemory requirement)
   learn_entropy: true
@@ -41,10 +49,26 @@ sac_cfg:
   gripper_action_idx: null          # no gripper on Factory tasks
   predict_success: true             # use pipeline's BCE success head (NOT Forge's action-dim approach)
   success_td_weight: 50.0            # weight on the success-head TD loss
-  success_td_discount: 0.95         # γ for the discounted-success target;
+  success_td_discount: 0.99         # γ for the discounted-success target;
                                     # ≈1 − 1/L → "P(success within ~150 steps)"
   success_info_key: is_success
+  success_streak_len: 1              # peg must remain seated for 5 consecutive
+                                    # steps (~0.33s @ 15Hz) for the trajectory to
+                                    # count as a success. Each streak step gets
+                                    # TD target=1; pre-streak bootstraps with γ;
+                                    # post-streak masked out. The same criterion
+                                    # is used for AUC/BCE/heatmap classification
+                                    # and the Episode/Success-rate diagnostic.
+  success_train_min_successes: 50   # gate the success-head TD loss until this many
+                                    # qualifying-streak trajectories have been
+                                    # observed. Prevents head saturation under the
+                                    # large success_td_weight. 0 disables gating.
+  success_heatmap_step_bins: 30    # vertical bins on success/fail P-mean heatmaps;
+                                    # set to max_episode_length for one row per step
   success_wrapper: null             # auto-detect "factory" wrapper from task prefix
+  recorder:
+    enabled: false                  # TiledCamera unusable on this IsaacSim/driver/GPU combo;
+                                    # see configs/exp_cfgs/default.yaml for the full block.
   experiment:
     directory: runs
     experiment_name: ""             # empty => runner auto-generates as <task>_sac_N<num_agents>

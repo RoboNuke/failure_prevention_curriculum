@@ -24,7 +24,7 @@ sac_cfg:
   learning_starts: 1500
   learn_entropy: true
   initial_entropy_value: 1.0e-2
-  target_entropy: -2.5                # null => skrl picks -|num_continuous|
+  target_entropy: -2.5 # x,y,z,yaw, success (5/2=2.5)
   grad_norm_clip: 0.0
   mixed_precision: false
   observation_preprocessor: RunningStandardScaler
@@ -32,10 +32,16 @@ sac_cfg:
   rewards_shaper_scale: null
   gripper_action_idx: null          # no gripper on Forge tasks
   predict_success: true            # Forge handles success internally via the action space
-  success_td_weight: 50.0
-  success_td_discount: 0.99    # unused when predict_success=false
+  ################################################
+  # These settings make our code match the FORGE paper
+  # Setting to zero means it will not effect training (using only forge reward)
+  success_td_weight: 0.0  
+  # set to 1, means that successful trajectories have every step set to 1 in buffer
+  success_td_discount: 1.0
+  # start training immediantly
+  success_train_min_successes: 0
+  #################################################
   success_info_key: is_success
-  success_train_min_successes: 100
   success_heatmap_step_bins: 30    # vertical bins on success/fail P-mean heatmaps;
                                     # set to max_episode_length for one row per step
   success_wrapper: null             # auto-detect "forge" wrapper from task prefix

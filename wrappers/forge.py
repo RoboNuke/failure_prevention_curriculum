@@ -14,11 +14,15 @@ sum. On episode end, the accumulated values are published in
 existing consumer partitions by agent and emits ``Episode_Reward/<term>`` per
 agent in per-episode units.
 
-We also inject ``info["is_success"]`` per step from ``env.ep_succeeded`` (the
-Factory env's per-env "did this episode reach success at any point" buffer).
-SAC's existing OR-accumulator + ``finalize_trajectory`` path picks it up so
-``Episode / Success rate`` reflects the fraction of recent episodes that
-reached the ``success_threshold``.
+We also inject ``info["is_success"]`` per step as the **instantaneous**
+``curr_successes`` flag captured by ``_log_factory_metrics`` *before* Isaac
+Lab's ``_get_dones`` / ``_reset_idx`` zeroes the upstream buffers. Reading
+``env.ep_succeeded`` post-step would lose any success achieved on the
+truncation step itself (since ``_reset_idx`` runs inside ``super().step()``
+for envs truncating this step) — same bug the factory wrapper fixes. SAC's
+streak-counter + ``finalize_trajectory`` path consumes the per-step flag and
+applies the trajectory-level criterion controlled by ``success_use_streak``
+and ``success_streak_len``.
 """
 
 from __future__ import annotations
@@ -144,13 +148,18 @@ class ForgeWrapper(RewardDecompositionWrapper):
         # manager so that hook is a no-op. We override its inject below.
         obs, reward, terminated, truncated, info = super().step(actions)
 
-        # Per-step success flag: env.ep_succeeded is True for any env that has
-        # reached success at any point in the current (still-ongoing OR just-
-        # ended-this-step) episode. SAC's OR-accumulator latches on this; even
-        # though _reset_idx zeroes ep_succeeded on terminating envs *during*
-        # this step, prior steps already latched True in the accumulator, so
-        # the trajectory label remains correct.
-        info["is_success"] = self._unwrapped.ep_succeeded.bool().clone()
+        # Per-step success flag — INSTANTANEOUS geometric success at this step,
+        # captured pre-reset by ``_log_factory_metrics``. We do NOT read
+        # ``unwrapped.ep_succeeded`` here because ``super().step()`` has
+        # already invoked ``_reset_idx`` on truncating envs which zeros it,
+        # losing any success achieved on the truncation step itself. SAC
+        # applies the trajectory-level criterion (streak or terminal) downstream.
+        device = self._unwrapped.device
+        num_envs = self._unwrapped.num_envs
+        if self._latest_curr_successes is not None:
+            info["is_success"] = self._latest_curr_successes.bool().view(-1).to(device).clone()
+        else:
+            info["is_success"] = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
         # Publish per-env tensors so SAC can partition by agent and emit
         # per-agent versions of `logs_rew/<term>`, `successes`, `success_times`

@@ -37,6 +37,34 @@ from skrl.utils.spaces.torch import compute_space_size
 from memory.multi_random import MultiRandomMemory
 
 
+def _find_first_streak(flags: torch.Tensor, n: int) -> tuple[int, int]:
+    """Return the (start, end) indices of the first window of ``n`` consecutive
+    True entries in the 1-D boolean tensor ``flags``. Returns ``(-1, -1)`` if
+    no such window exists.
+
+    ``end`` is inclusive (= start + n − 1). For n=1, this is just the first
+    True index; for n>1, this enforces the consecutive-streak criterion used
+    to gate trajectories as positive.
+    """
+    if n <= 0:
+        raise ValueError(f"streak length must be >= 1, got {n}")
+    if flags.numel() < n:
+        return -1, -1
+    # Run-length scan: count consecutive Trues; emit first index whose count
+    # reaches n. Implemented in Python on CPU since trajectories are short
+    # (≤ max_episode_length, typically a few hundred) and per-env.
+    flags_cpu = flags.detach().cpu().tolist()
+    run = 0
+    for i, v in enumerate(flags_cpu):
+        if v:
+            run += 1
+            if run >= n:
+                return i - n + 1, i
+        else:
+            run = 0
+    return -1, -1
+
+
 class TrajectoryBufferedMemory(MultiRandomMemory):
     def __init__(
         self,
@@ -45,6 +73,8 @@ class TrajectoryBufferedMemory(MultiRandomMemory):
         num_envs: int = 1,
         num_agents: int = 1,
         max_episode_length: int,
+        success_streak_len: int = 1,
+        success_use_streak: bool = True,
         device: Optional[Union[str, torch.device]] = None,
         export: bool = False,
         export_format: str = "pt",
@@ -65,7 +95,13 @@ class TrajectoryBufferedMemory(MultiRandomMemory):
             raise ValueError(
                 f"max_episode_length must be > 0, got {max_episode_length}"
             )
+        if success_streak_len < 1:
+            raise ValueError(
+                f"success_streak_len must be >= 1, got {success_streak_len}"
+            )
         self.max_episode_length = int(max_episode_length)
+        self.success_streak_len = int(success_streak_len)
+        self.success_use_streak = bool(success_use_streak)
 
         # Per-env staging area: one named tensor of shape
         # (num_envs, max_episode_length, size) per registered tensor name.
@@ -147,12 +183,27 @@ class TrajectoryBufferedMemory(MultiRandomMemory):
     def finalize_trajectory(self, env_indices: torch.Tensor) -> None:
         """Commit each finishing env's staged trajectory to the main buffer.
 
-        Reads each env's staged ``is_success_step`` (per-step bool) to find the
-        first-success step t*, then computes and stamps the three success-head
-        TD-target ingredients (``is_first_success_step``, ``success_terminal``,
-        ``success_loss_mask``) across that env's committed slots. SAC then
-        builds the bootstrap target online during ``update`` from these fields
-        plus the (live) head's prediction at next_obs.
+        Reads each env's staged ``is_success_step`` (per-step *instantaneous*
+        success flag — True iff the geometric success criterion holds right
+        now). Scans for the first window of ``success_streak_len`` consecutive
+        True flags ([t_start, t_end] with t_end = t_start + N − 1) and stamps
+        the three success-head TD-target ingredients across that env's
+        committed slots:
+
+          * ``is_first_success_step``: 1 at every step t in [t_start, t_end],
+            else 0. This is the "reward" term of the TD target.
+          * ``success_terminal``: 1 at every step t in [t_start, t_end], so
+            the bootstrap term collapses to 0 inside the streak — each
+            streak step has hard target = 1. For trajectories with no
+            qualifying streak: 1 at the final staged step (failure-terminal,
+            target = 0), else 0.
+          * ``success_loss_mask``: 1 for [0, t_end] (pre-streak + streak),
+            0 for (t_end, n−1] (post-streak rows masked out — agent may slip
+            out, label is undefined). For failed trajectories: all 1.
+
+        Pre-streak step at t < t_start has is_first=0 and terminal=0, so its
+        TD target is γ · V(s_{t+1}). Step t_start − 1 thus bootstraps from a
+        next-state whose target is 1, giving target ≈ γ.
 
         :param env_indices: 1D LongTensor of env indices whose trajectories just ended.
         """
@@ -184,22 +235,36 @@ class TrajectoryBufferedMemory(MultiRandomMemory):
             for name, staged in self._staging.items():
                 self.tensors[name][slot_idxs, env_i] = staged[env_i, :n]
 
-            # Find first-success step t* (or -1 if none).
+            # Resolve trajectory-level success criterion.
+            #   streak mode (default): first window of N consecutive Trues
+            #     anywhere in the trajectory; success anchors over the window,
+            #     mask covers [0, t_end], post-streak rows excluded.
+            #   terminal mode: success iff the final staged step's flag is True;
+            #     anchor at n-1 only, mask covers all steps. This mirrors the
+            #     "success at end" semantic and removes the touch-and-slip
+            #     definitional ambiguity entirely.
             is_succ = self._staging["is_success_step"][env_i, :n, 0].bool()
-            success_idx = is_succ.nonzero(as_tuple=False).flatten()
-            if success_idx.numel() > 0:
-                t_star = int(success_idx[0].item())
-                # is_first_success_step: 1 at t*, else 0.
+            if self.success_use_streak:
+                t_start, t_end = _find_first_streak(is_succ, self.success_streak_len)
+            else:
+                if bool(is_succ[n - 1].item()):
+                    t_start, t_end = n - 1, n - 1
+                else:
+                    t_start, t_end = -1, -1
+            if t_start >= 0:
+                # is_first_success_step: 1 across the streak, else 0. Drives
+                # the "reward" term of the TD target.
                 first_succ = torch.zeros(n, device=self.device, dtype=torch.float32)
-                first_succ[t_star] = 1.0
-                # success_terminal: 1 at t*, else 0 (no failure-terminal, the
-                # trajectory succeeded so the success-MDP terminates at t*).
+                first_succ[t_start : t_end + 1] = 1.0
+                # success_terminal: 1 across the streak, so each streak step
+                # collapses to a hard target of 1 (no bootstrap).
                 terminal = torch.zeros(n, device=self.device, dtype=torch.float32)
-                terminal[t_star] = 1.0
-                # success_loss_mask: 1 for steps in [0, t*], 0 for (t*, n-1].
-                # Post-success states have undefined "P(success)" — masked out.
+                terminal[t_start : t_end + 1] = 1.0
+                # success_loss_mask: 1 for [0, t_end] (pre-streak bootstrap +
+                # streak anchors), 0 for (t_end, n-1] (post-streak rows
+                # excluded — agent may slip out, label undefined).
                 mask = torch.zeros(n, device=self.device, dtype=torch.float32)
-                mask[: t_star + 1] = 1.0
+                mask[: t_end + 1] = 1.0
             else:
                 # Failed trajectory — final staged step is the failure-terminal.
                 first_succ = torch.zeros(n, device=self.device, dtype=torch.float32)
@@ -232,19 +297,18 @@ class TrajectoryBufferedMemory(MultiRandomMemory):
     ) -> List[List[torch.Tensor]]:
         """Sample a batch from finalized trajectories only.
 
-        Each agent samples ``batch_size // num_agents`` rows from its own env
-        partition; for each sampled env, the timestep is drawn uniformly from
-        that env's valid range (``[0, _env_main_index)`` if it hasn't wrapped,
-        else ``[0, memory_size)``). Raises if any env has zero finalized rows —
-        ``learning_starts`` should be ≥ ``max_episode_length`` to guarantee
-        every env has at least one finished episode in the buffer.
+        ``batch_size`` is **per-agent** (matching :class:`MultiRandomMemory`'s
+        contract — SAC.update relies on the same semantic across both memory
+        types so it can ``view(num_agents, batch_size, -1)`` over the result).
+        Each agent draws ``batch_size`` rows from its own env partition; for
+        each sampled env, the timestep is drawn uniformly from that env's
+        valid range (``[0, _env_main_index)`` if it hasn't wrapped, else
+        ``[0, memory_size)``). Total returned rows = ``batch_size * num_agents``.
+        Raises if any env has zero finalized rows — ``learning_starts`` should
+        be ≥ ``max_episode_length`` to guarantee every env has at least one
+        finished episode in the buffer.
         """
-        if batch_size % self.num_agents != 0:
-            raise ValueError(
-                f"batch_size ({batch_size}) must be divisible by num_agents "
-                f"({self.num_agents})"
-            )
-        per_agent = batch_size // self.num_agents
+        per_agent = batch_size
 
         t_max_per_env = torch.where(
             self._env_filled,

@@ -10,6 +10,7 @@ when provided.
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -18,6 +19,13 @@ class RunnerCfg:
 
     task: str
     """Isaac Lab gym id, e.g. ``"Isaac-Lift-Cube-Franka-v0"``."""
+
+    env_cfg_overrides: dict[str, Any] = dataclasses.field(default_factory=dict)
+    """Free-form overrides applied to the parsed Isaac Lab ``env_cfg`` *before*
+    ``gym.make``. Keys are dotted attribute paths resolved against the env_cfg
+    dataclass tree (e.g. ``task.hand_init_pos_noise``). Values must be a primitive
+    or a list of primitives — whatever the leaf field's type expects. Unknown
+    leaves and non-dotted keys are hard errors. Empty dict = no overrides."""
 
     num_envs: int
     """Envs PER agent. Total Isaac envs = ``num_envs * num_agents``."""

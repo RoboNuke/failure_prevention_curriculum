@@ -36,8 +36,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--logdir",
         type=str,
         default=None,
-        help="Overrides sac_cfg.experiment.directory from --config. "
-             "Relative paths are resolved against the project root.",
+        help="Log root directory. The final per-run output dir is "
+             "<logdir>/<sac_cfg.experiment.directory>/<experiment_name>. "
+             "If sac_cfg.experiment.directory equals the basename of --logdir "
+             "(legacy: both set to 'runs'), the family-subdir level is "
+             "collapsed to keep pre-existing experiment trees intact. "
+             "Relative paths are resolved against the project root. Defaults "
+             "to 'runs/' when omitted.",
     )
     parser.add_argument("--mode", type=str, choices=["train", "eval"], default="train")
     parser.add_argument(
@@ -76,8 +81,63 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_env_cfg_overrides(env_cfg, overrides: dict) -> None:
+    """Apply ``runner_cfg.env_cfg_overrides`` to an Isaac Lab env_cfg in place.
+
+    Each key is a dotted path resolved by ``getattr`` against ``env_cfg``; the
+    final segment is set with ``setattr``. Strict — if any intermediate or leaf
+    attribute is missing, raises ``AttributeError`` with the full path so typos
+    fail loudly instead of being silently absorbed by the dataclass.
+    """
+    if not overrides:
+        return
+    for dotted_path, value in overrides.items():
+        if not isinstance(dotted_path, str) or not dotted_path:
+            raise ValueError(
+                f"env_cfg_overrides keys must be non-empty dotted strings, got {dotted_path!r}"
+            )
+        parts = dotted_path.split(".")
+        target = env_cfg
+        for segment in parts[:-1]:
+            if not hasattr(target, segment):
+                raise AttributeError(
+                    f"env_cfg_overrides: '{dotted_path}' — '{segment}' not found on "
+                    f"{type(target).__name__}"
+                )
+            target = getattr(target, segment)
+        leaf = parts[-1]
+        if not hasattr(target, leaf):
+            raise AttributeError(
+                f"env_cfg_overrides: '{dotted_path}' — '{leaf}' not found on "
+                f"{type(target).__name__}"
+            )
+        setattr(target, leaf, value)
+        print(f"[runner] env_cfg override: {dotted_path} = {value}")
+
+
 def main() -> None:
     args = build_parser().parse_args()
+
+    # If the chosen YAML has ``sac_cfg.recorder.enabled: true``, IsaacLab will
+    # refuse to spawn the recorder TiledCamera without ``--enable_cameras``.
+    # Peek the YAML BEFORE booting AppLauncher and force the flag on so the
+    # user doesn't have to remember to pass it.
+    try:
+        import yaml as _yaml
+        with open(args.config) as _f:
+            _peek = _yaml.safe_load(_f) or {}
+        if (
+            _peek.get("sac_cfg", {})
+                 .get("recorder", {})
+                 .get("enabled", False)
+            and not getattr(args, "enable_cameras", False)
+        ):
+            args.enable_cameras = True
+            print("[runner] sac_cfg.recorder.enabled=true — forcing --enable_cameras on.")
+    except Exception as _e:
+        # If the YAML is malformed we'll surface the error during ConfigManager
+        # load below; don't block AppLauncher here.
+        print(f"[runner] could not peek YAML for recorder.enabled: {_e!r}")
 
     # Boot Omniverse before any isaaclab.envs imports.
     app_launcher = AppLauncher(args)
@@ -165,6 +225,85 @@ def main() -> None:
     # ---- env ----
     total_envs = runner_cfg.num_envs * runner_cfg.num_agents
     env_cfg = parse_env_cfg(runner_cfg.task, device=args.device, num_envs=total_envs)
+    _apply_env_cfg_overrides(env_cfg, runner_cfg.env_cfg_overrides)
+
+    # Inject the recorder camera. Direct envs like Factory/Forge construct
+    # their scenes manually inside ``FactoryEnv._setup_scene`` and never read
+    # ``env_cfg.scene.<sensor>`` cfg attrs — so the auto-discovery path used
+    # by manager-based envs (e.g. cartpole_camera) doesn't fire for them.
+    # Cartpole's working pattern is: spawn the TiledCamera USD prim under
+    # ``/World/envs/env_.*/Camera`` BEFORE ``self.scene.clone_environments(...)``
+    # runs (so the clone replicates env_0 -> env_1..N including the camera),
+    # then register with ``scene.sensors``. We bolt that pattern onto Factory
+    # by wrapping ``FactoryEnv._setup_scene``: run the original (which spawns
+    # the table/robot/peg AND calls clone_environments at its tail), but
+    # intercept the FIRST ``self.scene.clone_environments`` call from inside
+    # the original via a one-shot instance-level shim that does:
+    #   1. spawn TiledCamera on env_0
+    #   2. call original clone_environments (replicates env_0 -> all envs)
+    #   3. register the sensor with scene._sensors
+    if sac_cfg.recorder.enabled:
+        from isaaclab.sensors import TiledCamera, TiledCameraCfg
+        from isaaclab.sim.spawners.sensors import PinholeCameraCfg
+        from isaaclab_tasks.direct.factory.factory_env import FactoryEnv
+        from wrappers.recording import CAMERA_KEY as _RECORDER_CAMERA_KEY
+
+        rec = sac_cfg.recorder
+        cam_cfg = TiledCameraCfg(
+            prim_path=f"/World/envs/env_.*/{_RECORDER_CAMERA_KEY}",
+            offset=TiledCameraCfg.OffsetCfg(
+                pos=tuple(rec.camera_pos),
+                rot=tuple(rec.camera_quat),
+                convention="ros",
+            ),
+            data_types=["rgb"],
+            spawn=PinholeCameraCfg(
+                focal_length=float(rec.focal_length),
+                focus_distance=float(rec.focus_distance),
+                horizontal_aperture=float(rec.horizontal_aperture),
+                clipping_range=tuple(rec.clipping_range),
+            ),
+            width=int(rec.width),
+            height=int(rec.height),
+            update_period=0.0,
+        )
+
+        _original_factory_setup_scene = FactoryEnv._setup_scene
+
+        def _patched_factory_setup_scene(self):
+            # Install a one-shot instance-level shim on this scene's
+            # ``clone_environments`` so the camera spawn happens between
+            # Factory's manual robot/peg/table spawns and its clone call.
+            _orig_clone = self.scene.clone_environments
+
+            def _shim_clone(*args, **kwargs):
+                # Restore first to make this fire exactly once.
+                self.scene.clone_environments = _orig_clone
+                print(
+                    f"[recorder] spawning TiledCamera at {cam_cfg.prim_path} "
+                    "before clone_environments…",
+                    flush=True,
+                )
+                cam = TiledCamera(cam_cfg)
+                ret = _orig_clone(*args, **kwargs)
+                self.scene._sensors[_RECORDER_CAMERA_KEY] = cam
+                print(
+                    f"[recorder] env clone complete; camera registered as "
+                    f"scene.sensors[{_RECORDER_CAMERA_KEY!r}].",
+                    flush=True,
+                )
+                return ret
+
+            self.scene.clone_environments = _shim_clone
+            return _original_factory_setup_scene(self)
+
+        FactoryEnv._setup_scene = _patched_factory_setup_scene
+        print(
+            f"[runner] recorder enabled: TiledCamera '{_RECORDER_CAMERA_KEY}' "
+            f"({rec.width}x{rec.height}) will spawn inside FactoryEnv._setup_scene "
+            f"pre-clone; record_every_k_resets={rec.record_every_k_resets}"
+        )
+
     env = gym.make(runner_cfg.task, cfg=env_cfg, render_mode=None)
     # Always wrap with a subclass of skrl's IsaacLabWrapper. When no task-specific
     # wrapper was selected, fall back to RewardDecompositionWrapper so every
@@ -274,6 +413,8 @@ def main() -> None:
             num_envs=env.num_envs,
             num_agents=n_agents,
             max_episode_length=max_ep_len,
+            success_streak_len=int(getattr(sac_cfg, "success_streak_len", 1)),
+            success_use_streak=bool(getattr(sac_cfg, "success_use_streak", True)),
             device=device,
             replacement=True,
         )
@@ -299,15 +440,36 @@ def main() -> None:
         f"[runner] batch_size={cfg.batch_size} per agent  "
         f"(memory.sample returns {cfg.batch_size * n_agents:,} total rows / grad step)"
     )
-    # CLI > YAML > auto-generated
+    # CLI > YAML > auto-generated for the run name.
     exp_name = args.experiment_name or cfg.experiment.experiment_name or f"{runner_cfg.task}_sac_N{n_agents}"
     cfg.experiment.experiment_name = exp_name
-    if args.logdir is not None:
-        cfg.experiment.directory = args.logdir
-    # Anchor a relative `directory` to the project root so runs always land at
-    # <project_root>/<directory>, not wherever the user happened to invoke from.
-    if not os.path.isabs(cfg.experiment.directory):
-        cfg.experiment.directory = os.path.join(_PROJECT_ROOT, cfg.experiment.directory)
+
+    # Final per-run output dir = <log_root>/<family>/<experiment_name>
+    #   * log_root: --logdir CLI (e.g. "runs/", or absolute), default "runs/".
+    #   * family:   sac_cfg.experiment.directory from YAML (e.g. "pick_block",
+    #               "forge_pih"). Treated as a subdirectory under log_root so
+    #               experiments of the same kind stay grouped together.
+    #
+    # Legacy collapse: configs that pre-date this layout set
+    # sac_cfg.experiment.directory == "runs" (same as the default log root),
+    # which would otherwise produce a "runs/runs/<exp>" tree. When the family
+    # basename matches the log_root basename, we drop the nested level so
+    # those configs keep landing at "runs/<exp>" without YAML edits.
+    log_root = args.logdir if args.logdir is not None else "runs"
+    family = (cfg.experiment.directory or "").strip()
+    log_root_basename = os.path.basename(os.path.normpath(log_root)) if log_root else ""
+    family_basename = os.path.basename(os.path.normpath(family)) if family else ""
+    if not family or family_basename == log_root_basename:
+        final_directory = log_root
+    else:
+        final_directory = os.path.join(log_root, family)
+    # Anchor a relative path to the project root so runs always land at
+    # <project_root>/<final_directory>/<experiment_name>, not wherever the
+    # user happened to invoke from.
+    if not os.path.isabs(final_directory):
+        final_directory = os.path.join(_PROJECT_ROOT, final_directory)
+    cfg.experiment.directory = final_directory
+    print(f"[runner] experiment dir: {os.path.join(final_directory, exp_name)}")
 
     # ---- agent ----
     agent = SAC(
@@ -345,6 +507,40 @@ def main() -> None:
     # dump below. SAC.init() is idempotent — trainer.train() will call it again
     # but the second call returns immediately.
     agent.init(trainer_cfg=trainer.cfg)
+
+    # Recorder wrapper: opens a 3x4 grid GIF + TB video every K-th *global*
+    # reset (steps where every env reports done). Constructed after the SAC
+    # agent so its critics + state preprocessor can be passed in. The wrapper
+    # composes around the existing wrapper stack via attribute delegation, so
+    # the trainer's view of the env is unchanged.
+    if sac_cfg.recorder.enabled:
+        from wrappers.recording import RecordingWrapper
+
+        rec_max_ep_len = int(getattr(env.unwrapped, "max_episode_length", 0))
+        if rec_max_ep_len <= 0:
+            raise RuntimeError(
+                "sac_cfg.recorder.enabled=True but env.unwrapped.max_episode_length is "
+                "not set. The recorder pre-allocates a per-env frame buffer of fixed "
+                "max-episode-length."
+            )
+        rec_output_dir = os.path.join(agent.experiment_dir, sac_cfg.recorder.output_subdir)
+        # SAC writes images via a per-agent torch SummaryWriter; agent 0 is the
+        # canonical destination since the grid is global, not per-agent.
+        rec_image_writer = agent.per_agent_image_writers[0] if agent.per_agent_image_writers else None
+        env = RecordingWrapper(
+            env=env,
+            recorder_cfg=sac_cfg.recorder,
+            critic_1=agent.critic_1,
+            critic_2=agent.critic_2,
+            state_preprocessor=getattr(agent, "_state_preprocessor", None),
+            max_episode_length=rec_max_ep_len,
+            output_dir=rec_output_dir,
+            image_writer=rec_image_writer,
+        )
+        # The trainer was constructed pointing at the un-wrapped env; rebind so
+        # it talks to the recorder wrapper.
+        trainer.env = env
+        print(f"[runner] recorder wrapper attached; outputs -> {rec_output_dir}")
 
     # Snapshot the merged-and-CLI-applied configs into each agent's results dir so
     # any run can be reconstructed later without consulting the original YAML.

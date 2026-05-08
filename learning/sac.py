@@ -227,11 +227,36 @@ class SAC(Agent):
         self.success_td_weight: float = float(getattr(self.cfg, "success_td_weight", 0.0))
         self.success_td_discount: float = float(getattr(self.cfg, "success_td_discount", 0.99))
         self.success_info_key: str = str(getattr(self.cfg, "success_info_key", "is_success"))
+        self.success_train_min_successes: int = int(
+            getattr(self.cfg, "success_train_min_successes", 0)
+        )
+        self.success_streak_len: int = int(getattr(self.cfg, "success_streak_len", 1))
+        if self.success_streak_len < 1:
+            raise ValueError(
+                f"success_streak_len must be >= 1, got {self.success_streak_len}"
+            )
+        self.success_use_streak: bool = bool(getattr(self.cfg, "success_use_streak", True))
+        self.success_heatmap_step_bins: int = int(
+            getattr(self.cfg, "success_heatmap_step_bins", 30)
+        )
+        if self.success_heatmap_step_bins < 1:
+            raise ValueError(
+                f"success_heatmap_step_bins must be >= 1, got {self.success_heatmap_step_bins}"
+            )
+        # Cumulative count of finished trajectories with label=1 (OR over the
+        # trajectory's per-step `is_success_step`). Drives the
+        # `success_train_min_successes` gate that defers the success-head TD
+        # loss until enough positives are in the buffer. Counts globally
+        # across envs / agents.
+        self._cum_success_trajs: int = 0
 
-        # Per-env "success seen this trajectory so far" — OR-accumulated each step,
-        # reset on episode end. Allocated lazily in init() once we know the env count
-        # via the memory's num_envs attribute.
-        self._traj_success_so_far: torch.Tensor | None = None
+        # Per-env consecutive-success counter + latching "qualified" flag.
+        # `_traj_succ_streak[i]` increments while `is_success_step[i]` is
+        # True and resets to 0 on False. `_traj_qualified[i]` latches True
+        # once the streak reaches `success_streak_len`. Both are reset on
+        # episode end. Allocated lazily in init() once we know num_envs.
+        self._traj_succ_streak: torch.Tensor | None = None
+        self._traj_qualified: torch.Tensor | None = None
 
         # Per-step actor success probability stash from the most recent act()
         # call. Used by record_transition to feed the SuccessPredMetricsTracker
@@ -418,9 +443,17 @@ class SAC(Agent):
                     "success_loss_mask",
                 ])
 
-            # Per-env trajectory-success accumulator. Sized from the memory's num_envs
-            # (which the runner sets to total_envs = num_envs_per_agent * num_agents).
-            self._traj_success_so_far = torch.zeros(
+            # Per-env streak counter + latching qualified flag. Replaces the
+            # old "OR over is_success_step" accumulator. The trajectory is a
+            # success iff `is_success_step` (now per-step *instantaneous*) was
+            # True for at least `success_streak_len` consecutive steps; this
+            # is the same criterion the memory uses to stamp the TD targets,
+            # so the gate counter and `Episode / Success rate` diagnostic
+            # measure exactly what the head is being trained against.
+            self._traj_succ_streak = torch.zeros(
+                self.memory.num_envs, dtype=torch.long, device=self.device
+            )
+            self._traj_qualified = torch.zeros(
                 self.memory.num_envs, dtype=torch.bool, device=self.device
             )
 
@@ -479,6 +512,23 @@ class SAC(Agent):
                     timestep=timestep,
                 )
                 ep.clear()
+
+            # Cumulative successful trajectories observed (drives the
+            # `success_train_min_successes` gate). Emitted on every agent's
+            # writer so the gate state is visible in the same TB tab as the
+            # rest of the success diagnostics; the value is a global counter
+            # so all agents log the same number.
+            if self.predict_success:
+                writer.add_scalar(
+                    tag="Success Prediction Quality / cum success trajs",
+                    value=float(self._cum_success_trajs),
+                    timestep=timestep,
+                )
+                writer.add_scalar(
+                    tag="Success Prediction Quality / TD loss gate open",
+                    value=float(self._cum_success_trajs >= self.success_train_min_successes),
+                    timestep=timestep,
+                )
 
             # Per-trajectory forward distance (max/min/mean) — populated only when
             # a task-specific wrapper publishes per_env_episode_distance.
@@ -938,13 +988,29 @@ class SAC(Agent):
                     f"'Episode / Success rate' will not be logged. Wrap the env to enable."
                 )
                 self._warned_no_success_key = True
-        elif self._traj_success_so_far is not None:
-            if step_success.shape[0] != self._traj_success_so_far.shape[0]:
+        elif self._traj_qualified is not None:
+            if step_success.shape[0] != self._traj_qualified.shape[0]:
                 raise ValueError(
                     f"infos['{self.success_info_key}'] has shape {tuple(step_success.shape)} "
-                    f"but expected per-env tensor of length {self._traj_success_so_far.shape[0]}"
+                    f"but expected per-env tensor of length {self._traj_qualified.shape[0]}"
                 )
-            self._traj_success_so_far |= step_success
+            # Trajectory-level success label per env. Two modes:
+            #   streak mode (success_use_streak=True): increment a per-env
+            #     consecutive-success counter, latch `_traj_qualified` once it
+            #     reaches `success_streak_len`.
+            #   terminal mode (False): no per-step accumulation needed; the
+            #     label is just the value of `step_success` at the done step,
+            #     applied below in the `done_mask.any()` block. We still keep
+            #     the counter zeroed for invariant cleanliness.
+            if self.success_use_streak:
+                self._traj_succ_streak = torch.where(
+                    step_success,
+                    self._traj_succ_streak + 1,
+                    torch.zeros_like(self._traj_succ_streak),
+                )
+                self._traj_qualified |= (
+                    self._traj_succ_streak >= self.success_streak_len
+                )
 
             done_mask = (terminated.bool() | truncated.bool()).view(-1)
 
@@ -968,22 +1034,33 @@ class SAC(Agent):
                         num_agents=self.num_agents,
                         max_episode_length=max_ep_len,
                         device=self.device,
+                        success_streak_len=self.success_streak_len,
+                        success_use_streak=self.success_use_streak,
+                        heatmap_step_bins=self.success_heatmap_step_bins,
                     )
-                # Pass per_env_curr_successes (instantaneous goal flag) when
-                # the wrapper publishes it — gives the tracker a strict
-                # at-end outcome label (matches the env's ``successes``
-                # semantics). Falls back to "ever touched" when absent.
-                curr_succ_for_tracker = infos.get("per_env_curr_successes") if isinstance(infos, dict) else None
+                # The pred-quality tracker uses the same N-streak criterion
+                # (passed at construction) over `is_success_step`, so its
+                # outcome labels match the training labels exactly.
                 self._pred_quality_tracker.update(
                     success_prob=self._latest_success_prob,
                     is_success_step=step_success,
                     done_mask=done_mask,
-                    curr_success=curr_succ_for_tracker,
                 )
 
             if done_mask.any():
                 finished = done_mask.nonzero(as_tuple=False).view(-1)
-                labels = self._traj_success_so_far[finished].float()
+                if self.success_use_streak:
+                    labels = self._traj_qualified[finished].float()
+                else:
+                    # Terminal mode: label = is_success at the done step.
+                    labels = step_success[finished].float()
+                    # Keep `_traj_qualified` mirroring labels so the per-agent
+                    # buckets / gate counter clear cleanly below (reset path
+                    # zeroes both arrays unconditionally).
+                    self._traj_qualified[finished] = step_success[finished]
+                # Gate counter: count finished trajectories whose streak
+                # qualified them as positive.
+                self._cum_success_trajs += int(labels.sum().item())
                 epa = self.memory.num_envs // self.num_agents
                 # Diagnostic per-agent list (only populated when write_interval>0).
                 if self._per_agent_episodes_this_interval:
@@ -993,7 +1070,9 @@ class SAC(Agent):
                 # when we're training the success head.
                 if self.predict_success and self.training:
                     self.memory.finalize_trajectory(env_indices=finished)
-                self._traj_success_so_far[finished] = False
+                # Reset per-env streak state for the next episode.
+                self._traj_succ_streak[finished] = 0
+                self._traj_qualified[finished] = False
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         pass
@@ -1145,7 +1224,17 @@ class SAC(Agent):
                 # Backbone gradient comes from both this and the policy loss.
                 bce_per_sample = None
                 bce_masked_mean: torch.Tensor | None = None
-                if self.predict_success:
+                # Gate the success-head TD loss until enough positive-label
+                # trajectories have been observed. Until then the head sees
+                # only target≈0 anchors and (with a large `success_td_weight`)
+                # would saturate to logit≈−∞, fighting later positive
+                # gradients. While gated we still run the head's forward pass
+                # below for diagnostics (logit / prob in `outputs`) but
+                # contribute zero loss.
+                success_loss_gated_open = (
+                    self._cum_success_trajs >= self.success_train_min_successes
+                )
+                if self.predict_success and success_loss_gated_open:
                     if "success_logit" not in outputs:
                         raise RuntimeError(
                             "predict_success=True but policy.act() did not emit 'success_logit'. "

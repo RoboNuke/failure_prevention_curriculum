@@ -108,13 +108,27 @@ class FactoryWrapper(RewardDecompositionWrapper):
     def step(self, actions):
         obs, reward, terminated, truncated, info = super().step(actions)
 
-        # Per-step success flag. ``ep_succeeded[i]`` is True for any env that
-        # reached the success_threshold at any point in the current episode.
-        # SAC's OR-accumulator latches True; even though _reset_idx zeroes
-        # ep_succeeded on terminating envs DURING this step, prior steps
-        # already latched True in the accumulator, so trajectory labels are
-        # captured correctly at finalize_trajectory.
-        info["is_success"] = self._unwrapped.ep_succeeded.bool().clone()
+        # Per-step success flag — INSTANTANEOUS geometric success at this step
+        # (peg currently within the success_threshold of the goal pose). We
+        # publish the pre-reset snapshot captured by `_log_factory_metrics`
+        # rather than reading `unwrapped.curr_successes` post-step, because
+        # `super().step()` has already invoked `_reset_idx` on truncating
+        # envs which zeros the upstream tensor — reading it post-step loses
+        # any success achieved on the truncation step itself.
+        #
+        # Downstream (sac.py + memory) applies the N-consecutive-step streak
+        # criterion (`sac_cfg.success_streak_len`) to decide whether the
+        # trajectory is positive. We do NOT latch here — touch-and-slip
+        # should NOT be a positive unless the streak threshold is met.
+        device = self._unwrapped.device
+        num_envs = self._unwrapped.num_envs
+        if self._latest_curr_successes is not None:
+            info["is_success"] = self._latest_curr_successes.bool().view(-1).to(device).clone()
+        else:
+            # First step before the hook has fired (shouldn't happen since the
+            # hook runs inside _get_rewards which runs before step() returns,
+            # but be defensive): all-False placeholder.
+            info["is_success"] = torch.zeros(num_envs, dtype=torch.bool, device=device)
 
         # Publish per-env tensors so SAC can partition by agent and emit
         # per-agent metrics: `logs_rew/<term>` (unscaled per-step reward

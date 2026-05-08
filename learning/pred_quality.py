@@ -53,9 +53,10 @@ def _ensure_mpl():
     return _MPL
 
 
-# Number of step-bins along the heatmap Y axis. Independent of max_episode_length
-# so heatmaps are visually comparable across tasks of different episode lengths.
-_HEATMAP_STEP_BINS = 30
+# Default number of step-bins along the heatmap Y axis. Override per-run via
+# `sac_cfg.success_heatmap_step_bins`. Independent of max_episode_length so
+# heatmaps are visually comparable across tasks of different episode lengths.
+_DEFAULT_HEATMAP_STEP_BINS = 30
 # ECE bins: 10 equal-width bins of P over [0, 1].
 _ECE_BINS = 10
 
@@ -76,6 +77,9 @@ class PredictionQualityTracker:
         num_agents: int,
         max_episode_length: int,
         device: torch.device | str,
+        success_streak_len: int = 1,
+        success_use_streak: bool = True,
+        heatmap_step_bins: int = _DEFAULT_HEATMAP_STEP_BINS,
     ) -> None:
         if num_envs % num_agents != 0:
             raise ValueError(
@@ -86,33 +90,32 @@ class PredictionQualityTracker:
         self.epa = num_envs // num_agents
         self.device = torch.device(device)
         self.max_episode_length = int(max_episode_length)
-        self._n_bins = _HEATMAP_STEP_BINS
+        if success_streak_len < 1:
+            raise ValueError(
+                f"success_streak_len must be >= 1, got {success_streak_len}"
+            )
+        self.success_streak_len = int(success_streak_len)
+        self.success_use_streak = bool(success_use_streak)
+        if heatmap_step_bins < 1:
+            raise ValueError(
+                f"heatmap_step_bins must be >= 1, got {heatmap_step_bins}"
+            )
+        self._n_bins = int(heatmap_step_bins)
         self._ece_bins = _ECE_BINS
 
         # Per-env rollout staging.
         self._stage_P = torch.zeros(
             (num_envs, self.max_episode_length), dtype=torch.float32, device=self.device
         )
-        # ``_stage_succ`` is the per-step "ever touched goal" indicator (e.g.
-        # Factory's ``ep_succeeded``, which latches True from the first
-        # geometric success onward). Used to find the trajectory's first-
-        # success step t* — the same notion used for TD-target masking.
+        # ``_stage_succ`` is the per-step *instantaneous* success indicator
+        # (True iff the geometric success criterion holds right now). At
+        # finalize time we scan it for the first window of
+        # ``success_streak_len`` consecutive Trues — same criterion the
+        # memory uses to stamp the training TD targets. Outcome label is
+        # "trajectory contained a qualifying streak"; mask is [0, t_end].
         self._stage_succ = torch.zeros(
             (num_envs, self.max_episode_length), dtype=torch.bool, device=self.device
         )
-        # ``_stage_curr`` is the per-step *instantaneous* success indicator
-        # (e.g. Factory's ``curr_successes`` — True iff at goal pose right
-        # now). Optional — populated only when the wrapper publishes it. The
-        # truncation-step value is the trajectory's strict-outcome label
-        # (matches ``successes`` semantics) and is what we use to classify
-        # success vs failure for the pred-quality metrics. Without this we
-        # fall back to "ever touched" via _stage_succ, which on tasks where
-        # the agent often touches-and-slips makes every trajectory look like
-        # a success and silences the failure-class metrics.
-        self._stage_curr = torch.zeros(
-            (num_envs, self.max_episode_length), dtype=torch.bool, device=self.device
-        )
-        self._has_curr_data = False
         self._stage_t = torch.zeros(num_envs, dtype=torch.long, device=self.device)
 
         # Completed trajectories accumulated since the last flush, partitioned
@@ -127,6 +130,11 @@ class PredictionQualityTracker:
         # no data).
         self._hist_succ: list[list[np.ndarray]] = [[] for _ in range(num_agents)]
         self._hist_fail: list[list[np.ndarray]] = [[] for _ in range(num_agents)]
+        # Per-agent calibration history: one column per flush, length
+        # ``_ece_bins``, value = signed ``conf_b − acc_b`` per ECE bin (NaN
+        # where the bin had no rows this interval). Rendered with a diverging
+        # cmap centered on 0 — see _render_and_log_heatmap.
+        self._hist_calib: list[list[np.ndarray]] = [[] for _ in range(num_agents)]
 
     # ------------------------------------------------------------------
     # Per-step ingestion
@@ -136,20 +144,16 @@ class PredictionQualityTracker:
         success_prob: torch.Tensor,
         is_success_step: torch.Tensor,
         done_mask: torch.Tensor,
-        curr_success: torch.Tensor | None = None,
     ) -> None:
         """Stage one step per env, then finalize trajectories for envs whose
         ``done_mask`` is True.
 
         ``success_prob``    : (num_envs,) float in [0, 1] — actor's online prediction.
-        ``is_success_step`` : (num_envs,) bool — "ever touched goal" sticky indicator
-                              (e.g. Factory's ``ep_succeeded``). Used to find t*.
+        ``is_success_step`` : (num_envs,) bool — *instantaneous* per-step success
+                              flag (geometric criterion holds right now). At
+                              finalize-time, scanned for the first window of
+                              ``success_streak_len`` consecutive Trues.
         ``done_mask``       : (num_envs,) bool.
-        ``curr_success``    : (num_envs,) bool, optional — instantaneous geometric
-                              success indicator (e.g. Factory's ``curr_successes``).
-                              When provided, the trajectory's outcome label uses the
-                              truncation-step value (matches the env's ``successes``
-                              metric); when absent, falls back to "ever touched".
         """
         if success_prob.shape[0] != self.num_envs:
             raise ValueError(
@@ -164,9 +168,6 @@ class PredictionQualityTracker:
         env_idx = torch.arange(self.num_envs, device=self.device)
         self._stage_P[env_idx, self._stage_t] = success_prob.detach().to(self.device).float().view(-1)
         self._stage_succ[env_idx, self._stage_t] = is_success_step.to(self.device).bool().view(-1)
-        if curr_success is not None:
-            self._stage_curr[env_idx, self._stage_t] = curr_success.to(self.device).bool().view(-1)
-            self._has_curr_data = True
         self._stage_t = self._stage_t + 1
 
         if done_mask.any():
@@ -176,43 +177,57 @@ class PredictionQualityTracker:
         """Snapshot each finishing env's trajectory into the per-agent buffer and
         reset its staging.
 
-        Two distinct flags are derived from the staged data:
-        * ``t*`` (mask boundary) — first step of ``is_success_step`` (= ever-
-          touched-goal). Same notion the TD-target memory uses for masking.
-          Determines which steps contribute to the loss / metrics: pre-and-at
-          for trajectories with a t*, all steps for those without.
-        * ``outcome`` (per-trajectory label for AUC / per-class BCE / heatmap
-          classification) — when ``curr_success`` was staged, uses the value at
-          the truncation step (= what the env's ``successes`` metric measures);
-          otherwise falls back to "ever touched goal" (= ``t* exists``).
+        Outcome and mask are derived from the same N-streak criterion the
+        memory uses to stamp TD targets:
+        * Scan staged ``is_success_step`` for the first window of
+          ``success_streak_len`` consecutive Trues. The window ends at
+          ``t_end = t_start + N − 1``.
+        * If found: ``outcome=success``, mask covers ``[0, t_end]``
+          (pre-streak bootstrap steps + streak anchors). Post-streak rows
+          are excluded — agent may slip out, label is undefined there.
+        * If not found: ``outcome=failure``, mask covers all steps.
 
-        These differ on tasks like Factory where the agent can briefly touch
-        the goal pose then slip out: such trajectories have a real ``t*`` (so
-        post-touch steps get masked) but the strict outcome label is *failure*
-        (geometric criterion not met at end). Without this distinction every
-        touch-and-slip trajectory was being labelled success-class, which
-        silenced the failure-side metrics.
+        This guarantees the rollout-time predictive-quality metrics (AUC,
+        per-class BCE, ECE, monotonicity, heatmaps) classify trajectories
+        and weight steps the same way the training loss does — they
+        measure exactly what the head is being optimized to predict.
         """
+        n_streak = self.success_streak_len
         for env_i in env_indices.tolist():
             n = int(self._stage_t[env_i].item())
             if n == 0:
                 continue
             P = self._stage_P[env_i, :n].detach().cpu().numpy().astype(np.float32, copy=True)
             succ = self._stage_succ[env_i, :n].detach().cpu().numpy()
-            success_idx = np.flatnonzero(succ)
-            if success_idx.size > 0:
-                t_star = int(success_idx[0])
+
+            # Apply the same trajectory-level criterion the memory uses, so
+            # outcome labels and masks match the training TD targets.
+            t_start, t_end = -1, -1
+            if self.success_use_streak:
+                # First run of n_streak consecutive True.
+                if succ.size >= n_streak:
+                    run = 0
+                    for i in range(succ.size):
+                        if succ[i]:
+                            run += 1
+                            if run >= n_streak:
+                                t_start = i - n_streak + 1
+                                t_end = i
+                                break
+                        else:
+                            run = 0
+            else:
+                # Terminal mode: success iff the final staged step is True.
+                if succ.size > 0 and bool(succ[-1]):
+                    t_start, t_end = succ.size - 1, succ.size - 1
+
+            if t_start >= 0:
                 mask = np.zeros(n, dtype=bool)
-                mask[: t_star + 1] = True
+                mask[: t_end + 1] = True
+                outcome = True
             else:
                 mask = np.ones(n, dtype=bool)
-
-            if self._has_curr_data:
-                # Strict outcome: at goal pose at the truncation moment.
-                outcome = bool(self._stage_curr[env_i, n - 1].item())
-            else:
-                # Loose outcome fallback: ever touched goal.
-                outcome = success_idx.size > 0
+                outcome = False
 
             agent = env_i // self.epa
             self._completed[agent].append(
@@ -243,10 +258,9 @@ class PredictionQualityTracker:
 
             # Per-class trajectory counts surfaced unconditionally so a missing
             # AUC / BCE-failure / heatmap-failure can be diagnosed immediately:
-            # if ``num fail trajs`` is 0 every interval, the issue is the
-            # outcome label (e.g. on Factory ``info["is_success"]`` reflects
-            # ``ep_succeeded`` which latches on *any* touch of the goal pose,
-            # so trajectories that touch-and-slip are still labelled success).
+            # if ``num fail trajs`` is 0 every interval, every trajectory
+            # contains a qualifying N-streak — bump ``success_streak_len`` if
+            # the head is over-confidently calling everything a success.
             n_succ_trajs = sum(1 for t in trajs if t["outcome"])
             n_fail_trajs = len(trajs) - n_succ_trajs
             per_agent_tracking[i]["Success Prediction Quality / num success trajs"].append(
@@ -305,10 +319,14 @@ class PredictionQualityTracker:
                 bce_fail = float(-np.log(np.clip(1.0 - P_all[fail_rows], eps, 1.0)).mean())
                 per_agent_tracking[i]["Success Prediction Quality / BCE failure class"].append(bce_fail)
 
-            # ------ ECE (10 equal-width P bins) ------
+            # ------ ECE (10 equal-width P bins) + signed-gap heatmap column ------
+            # `calib_col[b]` = conf_b − acc_b (signed; negative = overconfident,
+            # positive = underconfident). NaN for empty bins so the heatmap
+            # renders them black via the diverging cmap's `set_bad`.
             ece = 0.0
             N = P_all.shape[0]
             edges = np.linspace(0.0, 1.0, self._ece_bins + 1)
+            calib_col = np.full(self._ece_bins, np.nan, dtype=np.float32)
             for b in range(self._ece_bins):
                 lo, hi = edges[b], edges[b + 1]
                 if b == self._ece_bins - 1:
@@ -320,8 +338,10 @@ class PredictionQualityTracker:
                     continue
                 conf_b = float(P_all[in_bin].mean())
                 acc_b = float(y_all[in_bin].mean())
+                calib_col[b] = conf_b - acc_b
                 ece += (n_b / N) * abs(conf_b - acc_b)
             per_agent_tracking[i]["Success Prediction Quality / ECE"].append(float(ece))
+            self._hist_calib[i].append(calib_col)
 
             # ------ Per-class trajectory monotonicity (outcome-relative) ------
             # For each non-masked traj-segment (length k_j), count step pairs
@@ -375,23 +395,72 @@ class PredictionQualityTracker:
 
             # Append a column to BOTH classes every interval so the two
             # heatmaps stay X-axis-aligned. Missing-class intervals get a
-            # zeros column (renders solid red under the RdYlGn cmap, visually
-            # signalling "no data of this class in this interval"). Both
-            # heatmaps re-render every flush.
-            zeros_col = np.zeros(self._n_bins, dtype=np.float32)
-            self._hist_succ[i].append(col_succ if col_succ is not None else zeros_col)
-            self._hist_fail[i].append(col_fail if col_fail is not None else zeros_col)
+            # NaN column, which renders BLACK under our cmap (cmap.set_bad)
+            # — visually distinct from any value in the [0,1] RdYlGn range,
+            # so "no data of this class in this interval" is unambiguous.
+            # Within a column, individual bins with no rows are also NaN
+            # (see `_build_column`), and likewise render black.
+            nan_col = np.full(self._n_bins, np.nan, dtype=np.float32)
+            self._hist_succ[i].append(col_succ if col_succ is not None else nan_col)
+            self._hist_fail[i].append(col_fail if col_fail is not None else nan_col)
+            # Step-binned heatmaps render with the y-axis labelled in actual
+            # episode-step units (0..max_episode_length) instead of bin
+            # indices. With `heatmap_step_bins` rows of pixel data, each row
+            # visually spans `max_episode_length / n_bins` steps — set
+            # `success_heatmap_step_bins = max_episode_length` for one row per
+            # step (no aggregation), keep it small (e.g. 30) to compare
+            # heatmaps across tasks of different episode lengths.
+            steps_per_bin = self.max_episode_length / max(1, self._n_bins)
+            step_ylabel = (
+                f"episode step (0..{self.max_episode_length - 1}, "
+                f"{steps_per_bin:g} step(s) per row)"
+            )
             self._render_and_log_heatmap(
                 history=self._hist_succ[i],
                 writer=per_agent_writers[i],
                 tag="Success Prediction Quality / heatmap success",
-                title=f"Success-trajectory mean P per step bin (agent {i})",
+                title=f"Success-trajectory mean P per episode step (agent {i})",
+                env_step=timestep,
+                y_extent=(0.0, float(self.max_episode_length)),
+                ylabel=step_ylabel,
             )
             self._render_and_log_heatmap(
                 history=self._hist_fail[i],
                 writer=per_agent_writers[i],
                 tag="Success Prediction Quality / heatmap failure",
-                title=f"Failure-trajectory mean P per step bin (agent {i})",
+                title=f"Failure-trajectory mean P per episode step (agent {i})",
+                env_step=timestep,
+                y_extent=(0.0, float(self.max_episode_length)),
+                ylabel=step_ylabel,
+            )
+
+            # Calibration heatmap: signed gap conf_b − acc_b per ECE bin over
+            # time. Diverging colormap red → green → blue, centered at 0:
+            #   negative = overconfident (P too high vs. realized accuracy)
+            #   ~zero    = well calibrated
+            #   positive = underconfident (P too low vs. realized accuracy)
+            # NaN bins (no rows in this interval) render black, same UX as
+            # the per-class heatmaps. vmin/vmax = ±1 covers the full range
+            # of conf−acc; in practice values cluster well inside this.
+            mpl_figure, mpl_cm = _ensure_mpl()
+            from matplotlib.colors import LinearSegmentedColormap
+            calib_cmap = LinearSegmentedColormap.from_list(
+                "calib_rgb", ["red", "green", "blue"], N=256
+            )
+            calib_cmap.set_bad(color="black")
+            self._render_and_log_heatmap(
+                history=self._hist_calib[i],
+                writer=per_agent_writers[i],
+                tag="Success Prediction Quality / heatmap calibration",
+                title=f"Calibration gap (conf − acc) per predicted-P (agent {i})",
+                env_step=timestep,
+                cmap=calib_cmap,
+                vmin=-1.0,
+                vmax=1.0,
+                y_extent=(0.0, 1.0),
+                ylabel=f"predicted P (0..1, {self._ece_bins} bins)",
+                cbar_label="conf − acc  (− overconfident, + underconfident)",
+                yticks=[b / self._ece_bins for b in range(self._ece_bins + 1)],
             )
 
             # Clear this agent's interval buffer.
@@ -401,25 +470,54 @@ class PredictionQualityTracker:
     # Heatmap rendering
     # ------------------------------------------------------------------
     def _render_and_log_heatmap(
-        self, *, history: list[np.ndarray], writer: Any, tag: str, title: str
+        self,
+        *,
+        history: list[np.ndarray],
+        writer: Any,
+        tag: str,
+        title: str,
+        env_step: int,
+        cmap: Any | None = None,
+        vmin: float = 0.0,
+        vmax: float = 1.0,
+        ylabel: str | None = None,
+        cbar_label: str = "mean P(success)",
+        y_extent: tuple[float, float] | None = None,
+        yticks: list[float] | None = None,
     ) -> None:
         mpl_figure, mpl_cm = _ensure_mpl()
         H = np.stack(history, axis=1)  # (n_bins, n_iters)
+        n_y = H.shape[0]
+        # Axis-label range; pixel data is unaffected.
+        y_lo, y_hi = y_extent if y_extent is not None else (0.0, float(n_y))
         fig = mpl_figure.Figure(figsize=(8, 4), dpi=100)
         ax = fig.add_subplot(111)
+        if cmap is None:
+            # Default: RdYlGn with NaN→black for the per-class P-mean heatmaps.
+            cmap = mpl_cm.get_cmap("RdYlGn").copy()
+            cmap.set_bad(color="black")
+        # X axis maps to env steps: each column corresponds to one
+        # write_interval, and we append a column every flush — so the columns
+        # span [0, env_step]. Y axis is step bin index.
         im = ax.imshow(
             H,
             aspect="auto",
-            vmin=0.0,
-            vmax=1.0,
+            vmin=vmin,
+            vmax=vmax,
             origin="lower",
-            cmap="RdYlGn",
+            cmap=cmap,
             interpolation="nearest",
+            extent=[0.0, float(env_step), y_lo, y_hi],
         )
-        ax.set_xlabel("flush iteration")
-        ax.set_ylabel(f"step bin (0..{self._n_bins - 1}, episode-relative)")
+        ax.set_xlabel("env steps")
+        ax.set_ylabel(
+            ylabel if ylabel is not None
+            else f"row (0..{n_y - 1})"
+        )
+        if yticks is not None:
+            ax.set_yticks(yticks)
         ax.set_title(title)
-        fig.colorbar(im, ax=ax, label="mean P(success)")
+        fig.colorbar(im, ax=ax, label=cbar_label)
         fig.tight_layout()
 
         buf = io.BytesIO()

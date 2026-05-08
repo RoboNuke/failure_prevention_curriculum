@@ -1,0 +1,87 @@
+# Lift Cube Franka — Isaac Lab manager-based task. action_space=8 (7 arm joints +
+# 1 binary gripper), obs=36 (single 'policy' group → SYMMETRIC actor-critic, no
+# state_space). Episode: 5s @ sim_dt=0.01s × decimation=2 ⇒ 50Hz × 5s = 250 steps.
+# The LiftSuccessWrapper is auto-selected from the task prefix and injects per-step
+# info["is_success"] via Isaac Lab's stock `object_reached_goal` (object position
+# within `threshold` m of the commanded goal pose) — instantaneous, not latching.
+# Every registered ConfigManager header must appear; unknown keys are hard errors.
+
+runner_cfg:
+  task: Isaac-Lift-Cube-Franka-v0
+  num_envs: 1024
+  num_agents: 3
+  total_timesteps: 300_000        # env.step() calls; transitions = total_timesteps * num_envs * num_agents
+  eval_timesteps: 250               # env.step() calls (~1 Lift episode at 250 steps)
+  memory_size: 10_000_000            # replay buffer capacity PER AGENT
+  seed: -1                                                                                 
+  env_cfg_overrides:                                   
+    rewards.action_rate.weight: 0.0
+    rewards.joint_vel.weight: 0.0
+    curriculum.action_rate: null                                                         
+    curriculum.joint_vel: null
+
+sac_cfg:
+  gradient_steps: 8
+  batch_size: 4096                  # per agent
+  discount_factor: 0.99
+  polyak: 0.005
+  actor_lr: 1.0e-4                  # AdamW
+  critic_lr: 3.0e-4                 # AdamW
+  entropy_lr: 1.0e-4                # AdamW (weight_decay always 0 for entropy)
+  weight_decay: 1.0e-2              # decoupled weight decay applied to actor + critic
+  random_timesteps: 5000
+  learning_starts: 5000             # buffer warm-up; predict_success=false uses MultiRandomMemory
+                                    # so there's no strict ≥ max_episode_length requirement
+  learn_entropy: true
+  initial_entropy_value: 1.0e-2
+  target_entropy: -3.5              # -|num_continuous|/2 = -7/2 — 7 continuous arm dims;
+                                    # the Bernoulli gripper has bounded log_prob and SAC's
+                                    # target-entropy convention is set on the continuous part
+  grad_norm_clip: 1.0
+  mixed_precision: false
+  observation_preprocessor: RunningStandardScaler
+  observation_preprocessor_kwargs: {}
+  rewards_shaper_scale: null
+  gripper_action_idx: 7             # binary gripper sits at action dim 7 (after panda_joint1..7);
+                                    # drives `Gripper / open rate / action mean / action std` TB scalars
+  predict_success: false            # BASELINE: no auxiliary success-prediction head.
+                                    # Flip to true to enable BCE-TD success head + pred-quality metrics;
+                                    # if you do, also raise learning_starts to ≥ 250 (max_episode_length)
+                                    # so TrajectoryBufferedMemory has a finalized trajectory per env
+                                    # before the first SAC.update().
+  success_td_weight: 1.0            # unused when predict_success=false
+  success_td_discount: 0.99         # unused when predict_success=false
+  success_info_key: is_success
+  success_train_min_successes: 0    # unused when predict_success=false
+  success_heatmap_step_bins: 30     # unused when predict_success=false
+  success_wrapper: null             # auto-detect "lift" wrapper from task prefix (Isaac-Lift-Cube-)
+  recorder:
+    enabled: false                  # TiledCamera unusable on this IsaacSim/driver/GPU combo;
+                                    # see configs/exp_cfgs/default.yaml for the full block.
+  experiment:
+    directory: pick_block
+    experiment_name: ""             # empty => runner auto-generates as <task>_sac_N<num_agents>
+    write_interval: 250             # one episode per write
+    checkpoint_interval: auto
+
+model_cfg:
+  actor:
+    act_init_std: 1.0
+    actor_n: 1
+    actor_latent: 128
+    last_layer_scale: 0.1           # tiny init → small initial actions, less tanh saturation
+    clip_log_std: true
+    min_log_std: -20.0
+    max_log_std: 2.0
+    reduction: sum
+    use_state_dependent_std: false
+    bernoulli_action_dims: [7]      # binary gripper at action index 7 — Bernoulli sample mapped
+                                    # to {-1, +1} so Isaac Lab's BinaryJointAction sees the right sign
+                                    # (≥0 ⇒ open, <0 ⇒ close). Straight-through estimator carries
+                                    # the critic gradient back through the soft probability.
+    force_zero_action_dims: null    # Lift uses ALL 8 action dims (no Forge-style force-zero)
+  critic:
+    critic_output_init_mean: 0.0
+    critic_n: 2
+    critic_latent: 1024
+    clip_actions: false

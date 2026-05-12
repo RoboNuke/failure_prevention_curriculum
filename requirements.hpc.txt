@@ -1,0 +1,23 @@
+# requirements.hpc.txt — for use INSIDE the Isaac Lab Apptainer container
+# (nvcr.io/nvidia/isaac-lab:2.1.0).
+#
+# The container already provides every third-party package this project
+# imports, so this file is intentionally minimal. It exists to (a) document
+# project-level Python deps and (b) catch drift if a future container drops
+# one of them.
+#
+# Versions are deliberately UNPINNED so pip won't clash with the container's
+# torch / Isaac Sim stack. Do NOT add CUDA-specific torch pins here.
+#
+# Install path on HPC (run inside the container shell):
+#   pip install --no-deps -r /work/requirements.hpc.txt
+#
+# --no-deps prevents pip from "upgrading" transitive deps that Isaac Sim
+# pinned for a reason.
+
+numpy
+torch
+gymnasium
+packaging
+pyyaml
+skrl

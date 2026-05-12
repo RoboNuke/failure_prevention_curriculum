@@ -35,7 +35,7 @@ done
 
 # ===== Static (env-level) config =====
 LOGDIR="$HOME/failure_prevention_curriculum/runs"
-CONDA_ENV="isaaclab"
+CONDA_ENV="fail"
 
 # ===== Derived paths =====
 PROJECT_ROOT="$HOME/failure_prevention_curriculum"

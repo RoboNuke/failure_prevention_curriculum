@@ -36,11 +36,10 @@ done
 # ===== Derived paths =====
 # Resolve PROJECT_ROOT from the script's own location so this works in any
 # clone path (HPC home != local home). LOGDIR follows project root by default;
-# override either via env var if needed (LOGDIR=... ./launchers/sac_block_e2e.sh ...).
+# override via env var if needed (LOGDIR=... ./launchers/sac_block_e2e.sh ...).
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 LOGDIR="${LOGDIR:-$PROJECT_ROOT/runs}"
-CONDA_ENV="${CONDA_ENV:-fail}"
 
 RUNNER="$PROJECT_ROOT/learning/runner.py"
 EXP_DIR="$LOGDIR/$EXPERIMENT_NAME"
@@ -52,20 +51,12 @@ if [[ "$CONFIG_PATH" != /* ]]; then
 fi
 
 # ===== Sanity =====
+# We assume the caller has already activated the right python env (conda env,
+# apptainer shell, venv, etc.) — the launcher does NOT manage environments.
 [[ -f "$RUNNER" ]] || { echo "[launcher] runner not found: $RUNNER" >&2; exit 1; }
 [[ -f "$CONFIG_PATH" ]] || { echo "[launcher] config not found: $CONFIG_PATH" >&2; exit 1; }
-command -v conda >/dev/null \
-    || { echo "[launcher] 'conda' not on PATH" >&2; exit 1; }
-
-# ===== Activate conda =====
-# `conda activate` requires conda.sh sourced; activation can return 0 even when the
-# env didn't actually change, so verify $CONDA_DEFAULT_ENV after.
-CONDA_BASE="$(conda info --base)"
-# shellcheck disable=SC1091
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate "$CONDA_ENV"
-[[ "${CONDA_DEFAULT_ENV:-}" == "$CONDA_ENV" ]] \
-    || { echo "[launcher] failed to activate conda env: $CONDA_ENV (got '${CONDA_DEFAULT_ENV:-<unset>}')" >&2; exit 1; }
+command -v python >/dev/null \
+    || { echo "[launcher] 'python' not on PATH — activate your env (conda/apptainer) before invoking" >&2; exit 1; }
 
 # ===== Read num_agents from YAML for the post-train checkpoint check =====
 # All other runner_cfg fields (task, num_envs, etc.) flow through to runner.py
@@ -75,7 +66,7 @@ NUM_AGENTS="$(python -c "import yaml,sys; print(yaml.safe_load(open('$CONFIG_PAT
 [[ "$NUM_AGENTS" =~ ^[0-9]+$ ]] \
     || { echo "[launcher] could not read runner_cfg.num_agents from $CONFIG_PATH (got '$NUM_AGENTS')" >&2; exit 1; }
 
-echo "[launcher] env=$CONDA_DEFAULT_ENV  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
+echo "[launcher] python=$(command -v python)  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
 
 # ===== Train =====
 # Ctrl-C (SIGINT, exit 130) is treated as "interrupted, proceed to eval with whatever

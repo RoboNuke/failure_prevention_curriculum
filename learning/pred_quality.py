@@ -80,6 +80,7 @@ class PredictionQualityTracker:
         success_streak_len: int = 1,
         success_use_streak: bool = True,
         heatmap_step_bins: int = _DEFAULT_HEATMAP_STEP_BINS,
+        on_finalize=None,
     ) -> None:
         if num_envs % num_agents != 0:
             raise ValueError(
@@ -102,6 +103,17 @@ class PredictionQualityTracker:
             )
         self._n_bins = int(heatmap_step_bins)
         self._ece_bins = _ECE_BINS
+
+        # Optional callback invoked inside _finalize for each finishing env.
+        # Signature: on_finalize(env_i, P_np, succ_np, outcome, n, extras) where
+        # ``extras`` is a dict of per-step tensors (sliced to [0:n] on the
+        # ``device``) staged via update(extra=...). Used by the rescue-buffer
+        # subsystem to run a backward scan + slot insertion without coupling
+        # tracker internals to that module.
+        self._on_finalize = on_finalize
+        # Lazy per-extra-tensor staging. Allocated on first update(..., extra=...)
+        # call so this stays free for predict_success-only configs.
+        self._stage_extras: dict[str, torch.Tensor] = {}
 
         # Per-env rollout staging.
         self._stage_P = torch.zeros(
@@ -144,6 +156,7 @@ class PredictionQualityTracker:
         success_prob: torch.Tensor,
         is_success_step: torch.Tensor,
         done_mask: torch.Tensor,
+        extra: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Stage one step per env, then finalize trajectories for envs whose
         ``done_mask`` is True.
@@ -168,6 +181,25 @@ class PredictionQualityTracker:
         env_idx = torch.arange(self.num_envs, device=self.device)
         self._stage_P[env_idx, self._stage_t] = success_prob.detach().to(self.device).float().view(-1)
         self._stage_succ[env_idx, self._stage_t] = is_success_step.to(self.device).bool().view(-1)
+        # Stage optional per-step extras alongside P / is_success_step. First
+        # encounter of a key allocates the storage tensor sized to match the
+        # extra's per-env shape: (num_envs, max_ep_len, *trailing).
+        if extra is not None:
+            for k, v in extra.items():
+                if v.shape[0] != self.num_envs:
+                    raise ValueError(
+                        f"extras[{k!r}] leading dim {v.shape[0]} != num_envs {self.num_envs}"
+                    )
+                tail = tuple(v.shape[1:])
+                buf = self._stage_extras.get(k)
+                if buf is None:
+                    buf = torch.zeros(
+                        (self.num_envs, self.max_episode_length, *tail),
+                        dtype=v.dtype if v.is_floating_point() else torch.float32,
+                        device=self.device,
+                    )
+                    self._stage_extras[k] = buf
+                buf[env_idx, self._stage_t] = v.detach().to(self.device).to(buf.dtype)
         self._stage_t = self._stage_t + 1
 
         if done_mask.any():
@@ -233,6 +265,16 @@ class PredictionQualityTracker:
             self._completed[agent].append(
                 {"P": P, "mask": mask, "outcome": outcome, "n": n}
             )
+            # Fire rescue-side callback BEFORE zeroing _stage_t so any consumer
+            # that needs the trailing trajectory length sees the post-increment
+            # value. Extras are sliced to [0:n] on-device; callback is free to
+            # copy to CPU / push to its own buffers.
+            if self._on_finalize is not None:
+                extras_slice: dict[str, torch.Tensor] = {}
+                for k, buf in self._stage_extras.items():
+                    extras_slice[k] = buf[env_i, :n].clone()
+                # P_np and mask are already CPU NumPy; outcome is python bool.
+                self._on_finalize(int(env_i), P, succ, bool(outcome), int(n), extras_slice)
             self._stage_t[env_i] = 0
 
     # ------------------------------------------------------------------
@@ -300,10 +342,9 @@ class PredictionQualityTracker:
 
             # ------ AUC(ROC) ------
             # Defined only when both classes are represented.
-            if y_all.min() < y_all.max():
-                from sklearn.metrics import roc_auc_score
-
-                auc = float(roc_auc_score(y_all, P_all))
+            from learning.calibration_utils import roc_auc as _roc_auc
+            auc = _roc_auc(P_all, y_all)
+            if auc is not None:
                 per_agent_tracking[i]["Success Prediction Quality / AUC ROC"].append(auc)
 
             # ------ Per-class BCE (calibration-style, vs trajectory label) ------
@@ -323,24 +364,9 @@ class PredictionQualityTracker:
             # `calib_col[b]` = conf_b − acc_b (signed; negative = overconfident,
             # positive = underconfident). NaN for empty bins so the heatmap
             # renders them black via the diverging cmap's `set_bad`.
-            ece = 0.0
-            N = P_all.shape[0]
-            edges = np.linspace(0.0, 1.0, self._ece_bins + 1)
-            calib_col = np.full(self._ece_bins, np.nan, dtype=np.float32)
-            for b in range(self._ece_bins):
-                lo, hi = edges[b], edges[b + 1]
-                if b == self._ece_bins - 1:
-                    in_bin = (P_all >= lo) & (P_all <= hi)  # include 1.0
-                else:
-                    in_bin = (P_all >= lo) & (P_all < hi)
-                n_b = int(in_bin.sum())
-                if n_b == 0:
-                    continue
-                conf_b = float(P_all[in_bin].mean())
-                acc_b = float(y_all[in_bin].mean())
-                calib_col[b] = conf_b - acc_b
-                ece += (n_b / N) * abs(conf_b - acc_b)
-            per_agent_tracking[i]["Success Prediction Quality / ECE"].append(float(ece))
+            from learning.calibration_utils import ece as _ece
+            ece_val, calib_col = _ece(P_all, y_all, self._ece_bins)
+            per_agent_tracking[i]["Success Prediction Quality / ECE"].append(float(ece_val))
             self._hist_calib[i].append(calib_col)
 
             # ------ Per-class trajectory monotonicity (outcome-relative) ------

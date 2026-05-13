@@ -8,11 +8,11 @@
 
 runner_cfg:
   task: Isaac-Lift-Cube-Franka-v0
-  num_envs: 1024
+  num_envs: 32
   num_agents: 1
-  total_timesteps: 300_000        # env.step() calls; transitions = total_timesteps * num_envs * num_agents
+  total_timesteps: 2000        # env.step() calls; transitions = total_timesteps * num_envs * num_agents
   eval_timesteps: 250               # env.step() calls (~1 Lift episode at 250 steps)
-  memory_size: 10_000_000            # replay buffer capacity PER AGENT
+  memory_size: 100_000            # replay buffer capacity PER AGENT
   seed: -1                                                                                 
   env_cfg_overrides:                                   
     rewards.action_rate.weight: 0.0
@@ -29,8 +29,8 @@ sac_cfg:
   critic_lr: 3.0e-4                 # AdamW
   entropy_lr: 1.0e-4                # AdamW (weight_decay always 0 for entropy)
   weight_decay: 1.0e-2              # decoupled weight decay applied to actor + critic
-  random_timesteps: 5000
-  learning_starts: 5000             # buffer warm-up; predict_success=false uses MultiRandomMemory
+  random_timesteps: 100
+  learning_starts: 500             # buffer warm-up; predict_success=false uses MultiRandomMemory
                                     # so there's no strict ≥ max_episode_length requirement
   learn_entropy: true
   initial_entropy_value: 1.0e-2
@@ -44,12 +44,12 @@ sac_cfg:
   rewards_shaper_scale: null
   gripper_action_idx: 7             # binary gripper sits at action dim 7 (after panda_joint1..7);
                                     # drives `Gripper / open rate / action mean / action std` TB scalars
-  predict_success: false            # BASELINE: no auxiliary success-prediction head.
+  predict_success: true            # BASELINE: no auxiliary success-prediction head.
                                     # Flip to true to enable BCE-TD success head + pred-quality metrics;
                                     # if you do, also raise learning_starts to ≥ 250 (max_episode_length)
                                     # so TrajectoryBufferedMemory has a finalized trajectory per env
                                     # before the first SAC.update().
-  success_td_weight: 1.0            # unused when predict_success=false
+  success_td_weight: 10.0            # unused when predict_success=false
   success_td_discount: 0.99         # unused when predict_success=false
   success_info_key: is_success
   success_train_min_successes: 0    # unused when predict_success=false
@@ -87,14 +87,14 @@ model_cfg:
     clip_actions: false
 
 rescue_buffer_cfg:
-  enabled: false                   # master toggle; when false, runner skips all rescue construction
+  enabled: true                    # master toggle; when false, runner skips all rescue construction
   # ---- Algorithm 1 hyperparameters (required even when disabled — fail-loud convention) ----
   tau: 0.7                         # f_phi(s_t) >= tau ⇒ rescue-point candidate
   delta: 0.3                       # f_phi(s_T) <= delta ⇒ trajectory eligible for rescue extraction
   alpha: 0.25                      # P(overwrite natural reset with rescue init) per done env
   rho_min: 0.3                     # min rolling success rate to (a) add and (b) sample
-  window_size: 256                 # rolling-window length (trajectories per agent)
-  max_buffer_size: 1024            # per-agent rescue buffer capacity
+  window_size: 32                 # rolling-window length (trajectories per agent)
+  max_buffer_size: 64            # per-agent rescue buffer capacity
   # ---- Algorithm extras ----
   dead_point_min_attempts: 3
   action_entropy_first_k_steps: 10

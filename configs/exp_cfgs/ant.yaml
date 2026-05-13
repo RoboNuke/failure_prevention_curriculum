@@ -64,3 +64,32 @@ model_cfg:
     critic_n: 2
     critic_latent: 1024
     clip_actions: false
+
+rescue_buffer_cfg:
+  enabled: false                   # master toggle; when false, runner skips all rescue construction
+  # ---- Algorithm 1 hyperparameters (required even when disabled — fail-loud convention) ----
+  tau: 0.7                         # f_phi(s_t) >= tau ⇒ rescue-point candidate
+  delta: 0.3                       # f_phi(s_T) <= delta ⇒ trajectory eligible for rescue extraction
+  alpha: 0.25                      # P(overwrite natural reset with rescue init) per done env
+  rho_min: 0.3                     # min rolling success rate to (a) add and (b) sample
+  window_size: 256                 # rolling-window length (trajectories per agent)
+  max_buffer_size: 1024            # per-agent rescue buffer capacity
+  # ---- Algorithm extras ----
+  dead_point_min_attempts: 3
+  action_entropy_first_k_steps: 10
+  # ---- Metric publication ----
+  metric_compute_interval: 960     # must equal sac_cfg.experiment.write_interval
+  buffer_snapshot_interval: 50000
+  snapshot_dir: rescue_snapshots
+  # ---- Section 5 — diversity / clustering ----
+  nn_query_subsample_rollout: 1.0
+  nn_distance_percentiles: [5, 25, 50]
+  dbscan_eps: null                 # null ⇒ auto-set to 5th-percentile pairwise dist at clustering time
+  dbscan_min_samples: 5
+  clustering_recompute_threshold: 25
+  min_buffer_size_for_clustering: 20
+  predictor_ece_n_bins: 10
+  projection_method: umap          # "umap" or "pca"
+  projection_recompute_threshold: 50
+  projection_n_neighbors: 15
+  projection_min_dist: 0.1

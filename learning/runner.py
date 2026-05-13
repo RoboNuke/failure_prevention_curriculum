@@ -172,6 +172,7 @@ def main() -> None:
     runner_cfg = loaded["runner_cfg"]
     sac_cfg = loaded["sac_cfg"]
     model_cfg = loaded["model_cfg"]
+    rescue_buffer_cfg = loaded["rescue_buffer_cfg"]
 
     # CLI > YAML for runner-level fields. Apply overrides to the loaded RunnerCfg so
     # the dump-config-to-disk step at the end records the values actually used.
@@ -507,6 +508,76 @@ def main() -> None:
     # dump below. SAC.init() is idempotent — trainer.train() will call it again
     # but the second call returns immediately.
     agent.init(trainer_cfg=trainer.cfg)
+
+    # Rescue-buffer subsystem: wraps the env with StateSnapshotWrapper (snapshot
+    # ring) then RescueInitWrapper (observe-only natural-reset hook), builds per-
+    # agent RescueBuffers and a RescueMetricsTracker, and attaches everything to
+    # the SAC agent. Strict prerequisites: sac_cfg.predict_success=True and env
+    # must expose max_episode_length. See configs/manager/rescue_buffer_cfg.py.
+    if rescue_buffer_cfg.enabled:
+        if not sac_cfg.predict_success:
+            raise RuntimeError(
+                "rescue_buffer_cfg.enabled=true requires sac_cfg.predict_success=true "
+                "(Algorithm 1 needs the success-prediction head)."
+            )
+        max_ep_len_rescue = int(getattr(env.unwrapped, "max_episode_length", 0))
+        if max_ep_len_rescue <= 0:
+            raise RuntimeError(
+                "rescue_buffer_cfg.enabled=true requires env.unwrapped.max_episode_length to be set."
+            )
+
+        from wrappers.state_snapshot_wrapper import StateSnapshotWrapper
+        from wrappers.rescue_init_wrapper import RescueInitWrapper
+        from memory.rescue_buffer import RescueBuffer
+        from learning.rescue_metrics import RescueMetricsTracker
+
+        env = StateSnapshotWrapper(env, max_episode_length=max_ep_len_rescue, device=device)
+        rescue_buffers = [
+            RescueBuffer(
+                capacity=int(rescue_buffer_cfg.max_buffer_size),
+                snapshot_dim=env.snapshot_dim,
+                obs_dim=int(obs_space.shape[0]),
+                device=device,
+                dead_point_min_attempts=int(rescue_buffer_cfg.dead_point_min_attempts),
+            )
+            for _ in range(n_agents)
+        ]
+        rescue_metrics = RescueMetricsTracker(
+            cfg=rescue_buffer_cfg,
+            summary_writers=agent.per_agent_image_writers,
+            observation_preprocessor=agent._observation_preprocessor,
+            success_prob_query=agent.success_prob_for_obs,
+            rescue_buffers=rescue_buffers,
+            num_agents=n_agents,
+            epa=env.num_envs // n_agents,
+            obs_dim=int(obs_space.shape[0]),
+            max_episode_length=max_ep_len_rescue,
+            write_interval=int(sac_cfg.experiment.write_interval),
+            experiment_dir=agent.experiment_dir,
+            device=device,
+        )
+        env = RescueInitWrapper(
+            env,
+            rescue_buffers=rescue_buffers,
+            state_snapshot=env,  # the StateSnapshotWrapper we just constructed
+            metrics_tracker=rescue_metrics,
+            num_agents=n_agents,
+            alpha=float(rescue_buffer_cfg.alpha),
+            rho_min=float(rescue_buffer_cfg.rho_min),
+        )
+        trainer.env = env
+        agent.attach_rescue(
+            cfg=rescue_buffer_cfg,
+            state_snapshot=env._state_snapshot,
+            rescue_buffers=rescue_buffers,
+            rescue_metrics=rescue_metrics,
+        )
+        print(
+            f"[runner] rescue subsystem enabled: tau={rescue_buffer_cfg.tau}, "
+            f"delta={rescue_buffer_cfg.delta}, alpha={rescue_buffer_cfg.alpha}, "
+            f"rho_min={rescue_buffer_cfg.rho_min}, W={rescue_buffer_cfg.window_size}, "
+            f"capacity={rescue_buffer_cfg.max_buffer_size}, snapshot_dim={env._state_snapshot.snapshot_dim}"
+        )
 
     # Recorder wrapper: opens a 3x4 grid GIF + TB video every K-th *global*
     # reset (steps where every env reports done). Constructed after the SAC

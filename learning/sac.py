@@ -275,6 +275,43 @@ class SAC(Agent):
         self._last_action_head_grad_norm: torch.Tensor | None = None
         self._last_success_head_grad_norm: torch.Tensor | None = None
 
+        # ---- Rescue buffer subsystem ----
+        # All attrs initialized to None / inert here; ``attach_rescue`` wires the
+        # collaborators when the runner has built them. None ⇒ attach not called,
+        # ⇒ rescue is disabled in this run (SAC behaves identically to the
+        # non-rescue path).
+        self._rescue_enabled: bool = False
+        self._rescue_cfg = None
+        self._rescue_buffers = None  # list[RescueBuffer]
+        self._rescue_metrics = None  # RescueMetricsTracker
+        self._state_snapshot = None  # StateSnapshotWrapper
+        # Per-env current-trajectory init type. Carries the "is this trajectory's
+        # initial state drawn from the rescue buffer?" flag for the lifetime of
+        # the trajectory; read at done-time to label the commit, then overwritten
+        # from info["initialized_from_rescue"] for the next trajectory.
+        self._traj_init_from_rescue: torch.Tensor | None = None
+        self._traj_init_slot_idx: torch.Tensor | None = None
+        self._traj_init_agent_idx: torch.Tensor | None = None
+        # Latest per-env action log-prob from act() — staged into pred_quality's
+        # extras ring at each record_transition step so finalize-time consumers
+        # can compute mean entropy over the first K steps. (num_envs,)
+        self._latest_log_prob: torch.Tensor | None = None
+        # Per-env per-step observation history used by the rescue post-episode
+        # hook to fetch s_{t*} and to feed the rolling-window state ring. The
+        # rescue path keeps full trajectory states because Section 6 visitation
+        # metrics need them.
+        # Allocated lazily on the first record_transition once we know obs_dim.
+        self._rescue_stage_obs: torch.Tensor | None = None
+        self._rescue_stage_log_prob: torch.Tensor | None = None
+        # Per-env current-trajectory cumulative reward (for commit_trajectory).
+        # Independent of self._cumulative_rewards (which is per-step partitioning
+        # to per-agent buckets and is zeroed every flush).
+        self._traj_return: torch.Tensor | None = None
+        self._traj_length: torch.Tensor | None = None
+        # Per-env first-success step (-1 if no success yet this trajectory).
+        # Tracked so commit_trajectory can publish time_to_success for §2.3.
+        self._traj_first_success_step: torch.Tensor | None = None
+
     # --------------------------------------------------------------
     # Per-agent helpers
     # --------------------------------------------------------------
@@ -289,6 +326,75 @@ class SAC(Agent):
         for i in range(self.num_agents):
             v = values_per_agent[i]
             self.per_agent_tracking[i][tag].append(v.item() if torch.is_tensor(v) else float(v))
+
+    # --------------------------------------------------------------
+    # Rescue-buffer attachment
+    # --------------------------------------------------------------
+    def attach_rescue(
+        self,
+        *,
+        cfg,
+        state_snapshot,
+        rescue_buffers,
+        rescue_metrics,
+    ) -> None:
+        """Wire the rescue-buffer collaborators. Fail-loud on any None.
+
+        Idempotent within a process — called once by the runner after agent.init().
+        Subsequent record_transitions will run the rescue post-episode hook and
+        write_tracking_data will flush rescue metrics.
+        """
+        if cfg is None:
+            raise ValueError("attach_rescue.cfg is required (no default).")
+        if state_snapshot is None:
+            raise ValueError("attach_rescue.state_snapshot is required (no default).")
+        if rescue_buffers is None or len(rescue_buffers) != self.num_agents:
+            raise ValueError(
+                f"attach_rescue.rescue_buffers must be a list of {self.num_agents} RescueBuffers"
+            )
+        if rescue_metrics is None:
+            raise ValueError("attach_rescue.rescue_metrics is required (no default).")
+        if not self.predict_success:
+            raise RuntimeError(
+                "attach_rescue requires sac_cfg.predict_success=True (Algorithm 1 needs the success head)."
+            )
+        self._rescue_cfg = cfg
+        self._state_snapshot = state_snapshot
+        self._rescue_buffers = rescue_buffers
+        self._rescue_metrics = rescue_metrics
+        self._rescue_enabled = True
+
+    def success_prob_for_obs(self, raw_obs: torch.Tensor, agent_i: int) -> torch.Tensor:
+        """Query the actor's success head for ``raw_obs`` belonging to ``agent_i``.
+
+        ``raw_obs`` is un-normalized; this method runs it through the per-agent
+        preprocessor and forward-passes the policy. Used by RescueMetricsTracker
+        §3 metrics over the rescue buffer's stored obs.
+        """
+        if not self.predict_success:
+            raise RuntimeError("success_prob_for_obs requires predict_success=True")
+        if raw_obs.ndim != 2:
+            raise ValueError(f"success_prob_for_obs: raw_obs must be 2-D, got {tuple(raw_obs.shape)}")
+        N = self.num_agents
+        n = int(raw_obs.shape[0])
+        if N == 1:
+            big = raw_obs
+        else:
+            # Pad other agent slots with copies of raw_obs[0:1]; the preprocessor
+            # wrapper expects an evenly-divisible batch with per-agent layout
+            # [agent_0..., agent_1..., ..., agent_{N-1}...]. We only consume the
+            # ``agent_i`` slice after the forward pass.
+            pad = raw_obs[:1].expand(n, -1)
+            chunks = [pad] * N
+            chunks[agent_i] = raw_obs
+            big = torch.cat(chunks, dim=0)
+        inputs = {"observations": self._observation_preprocessor(big)}
+        with torch.no_grad():
+            _, outputs = self.policy.act(inputs, role="policy")
+        sp = outputs["success_prob"].detach().view(-1)
+        if N == 1:
+            return sp
+        return sp[agent_i * n : (agent_i + 1) * n]
 
     def _compute_actor_head_grad_norms(self):
         """Return per-agent (action_head_grad_norm, success_head_grad_norm) tensors.
@@ -471,6 +577,17 @@ class SAC(Agent):
                 per_agent_writers=self.per_agent_image_writers,
                 timestep=timestep,
             )
+        # Rescue-buffer metrics: §1-6 of rescue_buffer_metrics_spec.md. Same
+        # contract as PredictionQualityTracker — scalars buffered into
+        # per_agent_tracking (consumed by the scalar flush loop below);
+        # histograms / images written directly. Only runs once attach_rescue
+        # has been called.
+        if self._rescue_enabled and self._rescue_metrics is not None:
+            self._rescue_metrics.flush_per_agent(
+                per_agent_tracking=self.per_agent_tracking,
+                per_agent_writers=self.per_agent_image_writers,
+                timestep=timestep,
+            )
 
         for i, writer in enumerate(self.per_agent_writers):
             for tag, values in self.per_agent_tracking[i].items():
@@ -576,6 +693,11 @@ class SAC(Agent):
         # tracker. Cheap clone — same shape as observations[:, 0].
         if self.predict_success and "success_prob" in outputs:
             self._latest_success_prob = outputs["success_prob"].detach().view(-1).clone()
+        # Stash per-env log-prob for the rescue subsystem's action-entropy
+        # metric (§2.5). Cheap clone of the same per-env scalar.
+        if self._rescue_enabled and "log_prob" in outputs:
+            lp = outputs["log_prob"].detach()
+            self._latest_log_prob = lp.view(-1).clone()
         return actions, outputs
 
     def record_transition(
@@ -598,6 +720,10 @@ class SAC(Agent):
         Skips ``super().record_transition`` because the base implementation accumulates
         a single global reward stream; we publish per-agent rewards instead.
         """
+        # Cache the current env-step on self so the on_finalize rescue callback
+        # (which runs deep inside pred_quality._finalize) can stamp add_step
+        # without threading the parameter through the tracker.
+        self._current_timestep = int(timestep)
         if self.write_interval > 0:
             if self._cumulative_rewards is None:
                 self._cumulative_rewards = torch.zeros_like(rewards, dtype=torch.float32)
@@ -1037,14 +1163,43 @@ class SAC(Agent):
                         success_streak_len=self.success_streak_len,
                         success_use_streak=self.success_use_streak,
                         heatmap_step_bins=self.success_heatmap_step_bins,
+                        on_finalize=(self._on_rescue_finalize if self._rescue_enabled else None),
                     )
+                    # Allocate the per-env trajectory bookkeeping the first time
+                    # we see real obs (gives us obs_dim cheaply).
+                    if self._rescue_enabled and self._traj_init_from_rescue is None:
+                        ne = self.memory.num_envs
+                        obs_dim = int(observations.shape[1])
+                        dev = self.device
+                        self._traj_init_from_rescue = torch.zeros(ne, dtype=torch.bool, device=dev)
+                        self._traj_init_slot_idx = torch.full((ne,), -1, dtype=torch.long, device=dev)
+                        self._traj_init_agent_idx = torch.full((ne,), -1, dtype=torch.long, device=dev)
+                        self._traj_return = torch.zeros(ne, dtype=torch.float32, device=dev)
+                        self._traj_length = torch.zeros(ne, dtype=torch.long, device=dev)
+                        self._traj_first_success_step = torch.full((ne,), -1, dtype=torch.long, device=dev)
                 # The pred-quality tracker uses the same N-streak criterion
                 # (passed at construction) over `is_success_step`, so its
                 # outcome labels match the training labels exactly.
+                # Stage obs + log_prob alongside P / is_success when the rescue
+                # subsystem is active. They land in the tracker's `_stage_extras`
+                # and are sliced to [0:n] when forwarded to the on_finalize cb.
+                extras: dict[str, torch.Tensor] | None = None
+                if self._rescue_enabled:
+                    if self._latest_log_prob is None or self._latest_log_prob.shape[0] != observations.shape[0]:
+                        # Edge case: first record_transition before the first
+                        # non-random act() call. Fall back to zero log_prob so
+                        # the stage tensor has consistent shape; entropy stat
+                        # over warm-up steps is meaningless anyway and the
+                        # first-K window is computed at episode end.
+                        lp_stage = torch.zeros(observations.shape[0], device=self.device)
+                    else:
+                        lp_stage = self._latest_log_prob
+                    extras = {"obs": observations.detach(), "log_prob": lp_stage}
                 self._pred_quality_tracker.update(
                     success_prob=self._latest_success_prob,
                     is_success_step=step_success,
                     done_mask=done_mask,
+                    extra=extras,
                 )
 
             if done_mask.any():
@@ -1073,6 +1228,190 @@ class SAC(Agent):
                 # Reset per-env streak state for the next episode.
                 self._traj_succ_streak[finished] = 0
                 self._traj_qualified[finished] = False
+
+            # ---- Rescue per-trajectory bookkeeping ----
+            # Runs whenever the rescue subsystem is attached (predict_success
+            # is guaranteed by attach_rescue, so we're inside the elif branch
+            # that already validated step_success). Maintains per-env totals
+            # used by ``commit_trajectory``: return, length, first_success_step.
+            # NOTE: ``done_mask`` was bound above just before pred_quality.update.
+            if self._rescue_enabled and self._traj_init_from_rescue is not None:
+                # Accumulate per-step return + length.
+                # rewards is (num_envs, 1); flatten for broadcasting.
+                self._traj_return += rewards.detach().view(-1).to(self._traj_return.dtype)
+                self._traj_length += 1
+                # First success step: latch the first index at which step_success
+                # is True. self._traj_length has just been bumped to step+1, so
+                # the step-index = length - 1.
+                if step_success.any():
+                    not_yet = self._traj_first_success_step < 0
+                    take = step_success & not_yet
+                    if take.any():
+                        idx = (self._traj_length - 1).to(self._traj_first_success_step.dtype)
+                        self._traj_first_success_step = torch.where(
+                            take, idx, self._traj_first_success_step
+                        )
+
+                # On done envs, commit the trajectory to the rescue metrics
+                # tracker. (The trajectory states + log_probs are sourced from
+                # the pred_quality tracker's staging via the on_finalize cb;
+                # we only handle the scalar / init-type half here.) Reading
+                # _traj_init_from_rescue gives the type of the JUST-ENDED
+                # trajectory; we update it from this step's info AFTER.
+                if done_mask.any():
+                    finished = done_mask.nonzero(as_tuple=False).view(-1)
+                    epa = self.memory.num_envs // self.num_agents
+                    for env_i_t in finished.tolist():
+                        env_i = int(env_i_t)
+                        agent_i = env_i // epa
+                        ret = float(self._traj_return[env_i].item())
+                        ln = int(self._traj_length[env_i].item())
+                        first_succ = int(self._traj_first_success_step[env_i].item())
+                        success = first_succ >= 0
+                        init_flag = bool(self._traj_init_from_rescue[env_i].item())
+                        slot_idx = int(self._traj_init_slot_idx[env_i].item())
+                        # action_entropy_first_k: mean of -log_prob over the
+                        # first K steps from pred_quality's extras ring.
+                        K = int(self._rescue_cfg.action_entropy_first_k_steps)
+                        ae_k = 0.0
+                        traj_states = None
+                        if self._pred_quality_tracker is not None:
+                            lp_buf = self._pred_quality_tracker._stage_extras.get("log_prob")
+                            obs_buf = self._pred_quality_tracker._stage_extras.get("obs")
+                            if lp_buf is not None:
+                                # _stage_t was already zeroed inside _finalize for
+                                # this env; use min(K, length).
+                                k_eff = min(K, ln)
+                                if k_eff > 0:
+                                    ae_k = float((-lp_buf[env_i, :k_eff]).mean().item())
+                            if obs_buf is not None:
+                                # Stage was zeroed for this env post-finalize but
+                                # only _stage_t — the obs slice was already copied
+                                # to extras BEFORE the cb? No: extras_slice in the
+                                # cb is the deep-copy via .clone(). We pass the
+                                # *cached* trajectory states from the cb directly
+                                # to commit (see _on_rescue_finalize).
+                                pass
+                        # The trajectory states come from the most-recent
+                        # on_finalize cb invocation (it cached per-env in
+                        # self._latest_rescue_extras). For default-init or any
+                        # trajectory that didn't trigger the rescue add path,
+                        # the cb still ran with the full extras dict.
+                        cached = getattr(self, "_latest_rescue_extras", {}).get(env_i)
+                        if cached is not None:
+                            traj_states = cached["obs"]
+                        else:
+                            # Shouldn't happen — pred_quality always fires
+                            # the callback for every done env when rescue is
+                            # attached. Defensive fallback: zero-length traj.
+                            traj_states = torch.zeros((ln, observations.shape[1]), device=self.device)
+                        self._rescue_metrics.commit_trajectory(
+                            agent_i=agent_i,
+                            success=success,
+                            ret=ret,
+                            length=ln,
+                            time_to_success=(first_succ if success else None),
+                            init_flag=init_flag,
+                            slot_idx=slot_idx,
+                            action_entropy_first_k=ae_k,
+                            states=traj_states,
+                        )
+                        # Reset per-env trajectory bookkeeping.
+                        self._traj_return[env_i] = 0
+                        self._traj_length[env_i] = 0
+                        self._traj_first_success_step[env_i] = -1
+                    # Drop the cached extras now that we've committed.
+                    if hasattr(self, "_latest_rescue_extras"):
+                        self._latest_rescue_extras = {}
+
+                # Now update _traj_init_from_rescue / _traj_init_slot_idx for
+                # the next trajectory using this step's info[] flags from the
+                # RescueInitWrapper. The wrapper writes True for envs it just
+                # rescue-init'd, False otherwise. Only update DONE envs — for
+                # non-done envs the current trajectory continues with its
+                # existing init-type label.
+                if (
+                    isinstance(infos, dict)
+                    and "initialized_from_rescue" in infos
+                    and done_mask.any()
+                ):
+                    finished = done_mask.nonzero(as_tuple=False).view(-1)
+                    nf = infos["initialized_from_rescue"]
+                    ns = infos.get("rescue_slot_idx")
+                    na = infos.get("rescue_agent_idx")
+                    if torch.is_tensor(nf):
+                        self._traj_init_from_rescue[finished] = nf.to(self.device).bool()[finished]
+                    if torch.is_tensor(ns):
+                        self._traj_init_slot_idx[finished] = ns.to(self.device).long()[finished]
+                    if torch.is_tensor(na):
+                        self._traj_init_agent_idx[finished] = na.to(self.device).long()[finished]
+
+    # ------------------------------------------------------------------
+    # Rescue post-episode hook (wired into PredictionQualityTracker.on_finalize)
+    # ------------------------------------------------------------------
+    def _on_rescue_finalize(
+        self,
+        env_i: int,
+        P_np,
+        succ_np,
+        outcome: bool,
+        n: int,
+        extras: dict,
+    ) -> None:
+        """Backward-scan a just-finished trajectory; on failure + gates, add s* to B_c.
+
+        Also caches the trajectory's extras (obs, log_prob) under
+        ``self._latest_rescue_extras[env_i]`` so the post-finalize
+        ``commit_trajectory`` block above can build the per-trajectory states
+        without re-reading the tracker.
+        """
+        if not self._rescue_enabled:
+            return
+        # Cache extras for the upcoming commit pass.
+        if not hasattr(self, "_latest_rescue_extras") or self._latest_rescue_extras is None:
+            self._latest_rescue_extras = {}
+        self._latest_rescue_extras[env_i] = extras
+
+        if outcome:
+            # Successful trajectory — Algorithm 1 only mines rescue points
+            # from failures (the trajectory's terminal state crossed below δ).
+            return
+        # Failure detector: P[-1] <= delta.
+        if n <= 0:
+            return
+        terminal_P = float(P_np[n - 1])
+        if terminal_P > float(self._rescue_cfg.delta):
+            return
+        # Rolling success-rate gate (ρ_min).
+        epa = self.memory.num_envs // self.num_agents
+        agent_i = env_i // epa
+        if self._rescue_metrics.p_hat_succ(agent_i) < float(self._rescue_cfg.rho_min):
+            return
+        # Backward scan for the latest t with P[t] >= tau. The snapshot wrapper
+        # captures POST-step states, so history[env_i, t-1] holds s_t (the state
+        # at the start of step t). s_0 (the trajectory's initial state) is not
+        # captured — Isaac Lab auto-resets terminated envs inside env.step(),
+        # leaving s_0 only momentarily visible to the wrapper between the inner
+        # step and our post-step capture. We require ``t_star >= 1`` so we
+        # always have a valid snapshot index ``t_star - 1``.
+        tau = float(self._rescue_cfg.tau)
+        t_star = -1
+        for t in range(n - 1, 0, -1):  # exclusive lower bound 0 → t in [n-1, 1]
+            if float(P_np[t]) >= tau:
+                t_star = t
+                break
+        if t_star < 1:
+            return
+        snap = self._state_snapshot.history_for_env_step(env_i, t_star - 1)
+        obs_at_tstar = extras["obs"][t_star].to(self.device)
+        slot = self._rescue_buffers[agent_i].add(
+            sim_state=snap,
+            obs=obs_at_tstar,
+            add_step=int(getattr(self, "_current_timestep", 0)),
+            add_p_value=float(P_np[t_star]),
+            source_trajectory_step=int(t_star),
+        )
+        self._rescue_metrics.bump_added(agent_i)
 
     def pre_interaction(self, *, timestep: int, timesteps: int) -> None:
         pass

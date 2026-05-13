@@ -55,18 +55,22 @@ fi
 # apptainer shell, venv, etc.) — the launcher does NOT manage environments.
 [[ -f "$RUNNER" ]] || { echo "[launcher] runner not found: $RUNNER" >&2; exit 1; }
 [[ -f "$CONFIG_PATH" ]] || { echo "[launcher] config not found: $CONFIG_PATH" >&2; exit 1; }
-command -v python >/dev/null \
-    || { echo "[launcher] 'python' not on PATH — activate your env (conda/apptainer) before invoking" >&2; exit 1; }
+# Resolve python: PYTHON env var (e.g. PYTHON=/isaac-sim/python.sh) wins,
+# else fall back to `python` on PATH. Set in your shell or sbatch script to
+# point at the container's python wrapper.
+PYTHON="${PYTHON:-python}"
+command -v "$PYTHON" >/dev/null \
+    || { echo "[launcher] python interpreter '$PYTHON' not found — set PYTHON=/path/to/python (e.g. /isaac-sim/python.sh) or put one on PATH" >&2; exit 1; }
 
 # ===== Read num_agents from YAML for the post-train checkpoint check =====
 # All other runner_cfg fields (task, num_envs, etc.) flow through to runner.py
 # implicitly via --config; only num_agents is needed bash-side to walk per-agent
 # checkpoint dirs.
-NUM_AGENTS="$(python -c "import yaml,sys; print(yaml.safe_load(open('$CONFIG_PATH'))['runner_cfg']['num_agents'])")"
+NUM_AGENTS="$("$PYTHON" -c "import yaml,sys; print(yaml.safe_load(open('$CONFIG_PATH'))['runner_cfg']['num_agents'])")"
 [[ "$NUM_AGENTS" =~ ^[0-9]+$ ]] \
     || { echo "[launcher] could not read runner_cfg.num_agents from $CONFIG_PATH (got '$NUM_AGENTS')" >&2; exit 1; }
 
-echo "[launcher] python=$(command -v python)  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
+echo "[launcher] python=$(command -v "$PYTHON")  config=$CONFIG_PATH  experiment=$EXPERIMENT_NAME  num_agents=$NUM_AGENTS"
 
 # ===== Train =====
 # Ctrl-C (SIGINT, exit 130) is treated as "interrupted, proceed to eval with whatever
@@ -75,7 +79,7 @@ echo "[launcher] python=$(command -v python)  config=$CONFIG_PATH  experiment=$E
 # `set -e` and the ERR trap for this one command so we can branch on the code.
 echo "[launcher] === TRAIN (config=$CONFIG_PATH) ==="
 TRAIN_RC=0
-python "$RUNNER" \
+"$PYTHON" "$RUNNER" \
     --config "$CONFIG_PATH" \
     --experiment_name "$EXPERIMENT_NAME" \
     --logdir "$LOGDIR" \
@@ -115,7 +119,7 @@ done
 # `--mode eval` makes the runner use runner_cfg.eval_timesteps instead of total_timesteps.
 if [[ "$RUN_EVAL" -eq 1 ]]; then
     echo "[launcher] === EVAL (config=$CONFIG_PATH, checkpoint=$EXP_DIR) ==="
-    python "$RUNNER" \
+    "$PYTHON" "$RUNNER" \
         --config "$CONFIG_PATH" \
         --experiment_name "$EVAL_EXP_NAME" \
         --logdir "$LOGDIR" \

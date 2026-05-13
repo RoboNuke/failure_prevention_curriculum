@@ -33,12 +33,15 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-# ===== Static (env-level) config =====
-LOGDIR="$HOME/failure_prevention_curriculum/runs"
-CONDA_ENV="fail"
-
 # ===== Derived paths =====
-PROJECT_ROOT="$HOME/failure_prevention_curriculum"
+# Resolve PROJECT_ROOT from the script's own location so this works in any
+# clone path (HPC home != local home). LOGDIR follows project root by default;
+# override either via env var if needed (LOGDIR=... ./launchers/sac_block_e2e.sh ...).
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+LOGDIR="${LOGDIR:-$PROJECT_ROOT/runs}"
+CONDA_ENV="${CONDA_ENV:-fail}"
+
 RUNNER="$PROJECT_ROOT/learning/runner.py"
 EXP_DIR="$LOGDIR/$EXPERIMENT_NAME"
 EVAL_EXP_NAME="${EXPERIMENT_NAME}_eval"

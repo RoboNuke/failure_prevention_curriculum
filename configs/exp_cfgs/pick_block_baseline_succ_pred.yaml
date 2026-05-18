@@ -89,7 +89,7 @@ model_cfg:
 rescue_buffer_cfg:
   enabled: true                    # master toggle; when false, runner skips all rescue construction
   # ---- Algorithm 1 hyperparameters (required even when disabled — fail-loud convention) ----
-  tau: 0.7                         # f_phi(s_t) >= tau ⇒ rescue-point candidate
+  tau: 0.5                         # f_phi(s_t) >= tau ⇒ rescue-point candidate
   delta: 0.3                       # f_phi(s_T) <= delta ⇒ trajectory eligible for rescue extraction
   alpha: 0.25                      # P(overwrite natural reset with rescue init) per done env
   rho_min: 0.3                     # min rolling success rate to (a) add and (b) sample

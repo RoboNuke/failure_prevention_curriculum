@@ -77,7 +77,7 @@ rescue_buffer_cfg:
   window_size: 256                 # rolling-window length (trajectories per agent)
   max_buffer_size: 1024            # per-agent rescue buffer capacity
   # ---- Algorithm extras ----
-  dead_point_min_attempts: 3
+  dead_point_min_attempts: 10
   action_entropy_first_k_steps: 10
   # ---- Metric publication ----
   metric_compute_interval: 150     # must equal sac_cfg.experiment.write_interval
@@ -86,7 +86,7 @@ rescue_buffer_cfg:
   # ---- Section 5 — diversity / clustering ----
   nn_query_subsample_rollout: 1.0
   nn_distance_percentiles: [5, 25, 50]
-  dbscan_eps: null                 # null ⇒ auto-set to 5th-percentile pairwise dist at clustering time
+  dbscan_eps: 2.2                 # null ⇒ auto-set to 5th-percentile pairwise dist at clustering time
   dbscan_min_samples: 5
   clustering_recompute_threshold: 25
   min_buffer_size_for_clustering: 20
